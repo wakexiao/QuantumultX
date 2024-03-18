@@ -3,13 +3,6 @@
 # > 更新时间  2022.11.05
 # > */  
 
-# > 民生银行
-host-keyword, cm-10-134.getui.com, reject
-host-keyword, sdk.open.talk.getui.com, reject
-host-keyword, cm-10-35.getui.com, reject
-host-keyword, c-hzgt2.getui.com, reject
-HOST-SUFFIX,sdk.open.talk.igexin.com, reject
-
 ## QQ音乐广告
 HOST,tmeadcomm.y.qq.com, reject
 HOST,ad.tencentmusic.com, reject
@@ -189,10 +182,6 @@ HOST,vv.video.qq.com, reject
 HOST,wa.gtimg.com, reject
 # HOST,wxsnsdy.wxs.qq.com, reject
 # HOST,wxsnsdythumb.wxs.qq.com, reject
-
-# > 同花顺
-HOST,adm.10jqka.com.cn, reject
-HOST,stat.10jqka.com.cn, REJECT
 
 # > keep
 HOST,apm.gotokeep.com, reject
