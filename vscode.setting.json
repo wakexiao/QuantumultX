@@ -1,0 +1,80 @@
+{
+  "editor.suggestSelection": "first",
+  "vsintellicode.modify.editor.suggestSelection": "automaticallyOverrodeDefaultValue",
+  "workbench.colorTheme": "One Dark Pro",
+  "editor.formatOnSave": true,
+  "[javascript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "terminal.integrated.defaultProfile.windows": "Git Bash",
+  "remote.SSH.remotePlatform": {
+    "47.115.76.70": "linux"
+  },
+  "[typescriptreact]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "emmet.triggerExpansionOnTab": true,
+  "[html]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[vue]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[json]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "security.workspace.trust.untrustedFiles": "open",
+  "editor.tabSize": 2,
+  "editor.detectIndentation": false,
+  "javascript.preferences.quoteStyle": "single",
+  "typescript.preferences.quoteStyle": "single",
+  "[typescript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "prettier.singleQuote": true,
+  "turboConsoleLog.quote": "'",
+  "files.eol": "\n",
+  "[scss]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "tabnine.experimentalAutoImports": true,
+  "editor.inlineSuggest.enabled": true,
+  "github.copilot.enable": {
+    "*": true,
+    "yaml": false,
+    "plaintext": false,
+    "markdown": false
+  },
+  "[less]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "leek-fund.stocks": [
+    "sh000001",
+    "sh000300",
+    "sh000016",
+    "sh000688",
+    "hk03690",
+    "hk00700",
+    "usr_ixic",
+    "usr_dji",
+    "usr_inx",
+    "nf_ZC0",
+    "nf_IC0",
+    "hf_OIL",
+    "hf_CHA50CFD",
+    "sh603690"
+  ],
+  "merge-conflict.autoNavigateNextConflict.enabled": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "prettier.bracketSameLine": true,
+  "git.confirmSync": false,
+  "eslint.alwaysShowStatus": true,
+  "Codegeex.Privacy": false,
+  "Codegeex.Survey": false,
+  "diffEditor.ignoreTrimWhitespace": false,
+  "workbench.tree.enableStickyScroll": true
+}
