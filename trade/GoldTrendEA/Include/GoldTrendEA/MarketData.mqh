@@ -74,6 +74,9 @@ public:
    double            High(const ENUM_TIMEFRAMES tf, const int shift)  { return iHigh(m_symbol, tf, shift);  }
    double            Low(const ENUM_TIMEFRAMES tf, const int shift)   { return iLow(m_symbol, tf, shift);   }
 
+   //--- K 线开盘时间（shift=0 为当前未收盘K线；G4 信号评估缓存键用）
+   datetime          BarTime(const ENUM_TIMEFRAMES tf, const int shift = 0) { return iTime(m_symbol, tf, shift); }
+
    //--- 当前点差（点）
    long              SpreadPoints()
      {

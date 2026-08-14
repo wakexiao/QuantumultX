@@ -12,6 +12,9 @@
 //--- 单日日志容量告警阈值 50MB（修复四）
 #define GTEA_LOG_MAX_BYTES  (50 * 1024 * 1024)
 
+//--- C6：WARN 节流表 key 数量上限（防御性，key 种类理论上有限）
+#define GTEA_THROTTLE_MAX_KEYS  100
+
 //--- 日志级别
 enum ENUM_LOG_LEVEL
   {
@@ -161,6 +164,20 @@ public:
            }
         }
       // 新 key：登记并记录
+      // C6：节流表容量上限防御 —— 若 key 异常膨胀（如误将动态内容拼入
+      //     key）则不再扩容，改为复用最旧槽位（LRU 淘汰），避免数组无限
+      //     增长；代价仅是被淘汰 key 下次出现时多记一条 WARN，可接受
+      if(n >= GTEA_THROTTLE_MAX_KEYS)
+        {
+         int oldest = 0;
+         for(int i = 1; i < n; i++)
+            if(m_throttleTimes[i] < m_throttleTimes[oldest])
+               oldest = i;
+         m_throttleKeys[oldest]  = key;
+         m_throttleTimes[oldest] = now;
+         Warn(msg);
+         return;
+        }
       ArrayResize(m_throttleKeys, n + 1);
       ArrayResize(m_throttleTimes, n + 1);
       m_throttleKeys[n]  = key;

@@ -81,16 +81,17 @@ public:
      }
 
    //--- 释放全部句柄（OnDeinit 中调用，方案 6.2）
+   //    C1：释放后将句柄成员重置为 INVALID_HANDLE，防止重复释放与释放后误用
    void              Release()
      {
-      if(m_hEmaFastTrend != INVALID_HANDLE) IndicatorRelease(m_hEmaFastTrend);
-      if(m_hEmaMidTrend  != INVALID_HANDLE) IndicatorRelease(m_hEmaMidTrend);
-      if(m_hEmaSlowTrend != INVALID_HANDLE) IndicatorRelease(m_hEmaSlowTrend);
-      if(m_hAdxTrend     != INVALID_HANDLE) IndicatorRelease(m_hAdxTrend);
-      if(m_hEmaFastSig   != INVALID_HANDLE) IndicatorRelease(m_hEmaFastSig);
-      if(m_hEmaMidSig    != INVALID_HANDLE) IndicatorRelease(m_hEmaMidSig);
-      if(m_hMacdSig      != INVALID_HANDLE) IndicatorRelease(m_hMacdSig);
-      if(m_hAtrSig       != INVALID_HANDLE) IndicatorRelease(m_hAtrSig);
+      if(m_hEmaFastTrend != INVALID_HANDLE) { IndicatorRelease(m_hEmaFastTrend); m_hEmaFastTrend = INVALID_HANDLE; }
+      if(m_hEmaMidTrend  != INVALID_HANDLE) { IndicatorRelease(m_hEmaMidTrend);  m_hEmaMidTrend  = INVALID_HANDLE; }
+      if(m_hEmaSlowTrend != INVALID_HANDLE) { IndicatorRelease(m_hEmaSlowTrend); m_hEmaSlowTrend = INVALID_HANDLE; }
+      if(m_hAdxTrend     != INVALID_HANDLE) { IndicatorRelease(m_hAdxTrend);     m_hAdxTrend     = INVALID_HANDLE; }
+      if(m_hEmaFastSig   != INVALID_HANDLE) { IndicatorRelease(m_hEmaFastSig);   m_hEmaFastSig   = INVALID_HANDLE; }
+      if(m_hEmaMidSig    != INVALID_HANDLE) { IndicatorRelease(m_hEmaMidSig);    m_hEmaMidSig    = INVALID_HANDLE; }
+      if(m_hMacdSig      != INVALID_HANDLE) { IndicatorRelease(m_hMacdSig);      m_hMacdSig      = INVALID_HANDLE; }
+      if(m_hAtrSig       != INVALID_HANDLE) { IndicatorRelease(m_hAtrSig);       m_hAtrSig       = INVALID_HANDLE; }
      }
 
    //--- CopyBuffer 通用封装：读单个值（shift≥1，已收盘K线）

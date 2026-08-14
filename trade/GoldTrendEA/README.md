@@ -1,7 +1,7 @@
 # GoldTrendEA — 黄金外汇「顺势一单一结」EA 框架
 
 > 对应方案文档：[黄金外汇EA顺势一单一结开发方案.md](../黄金外汇EA顺势一单一结开发方案.md)
-> 当前版本：v0.10（M1 框架搭建阶段产出：接口定义 + 骨架实现，**非完整可交易版本**）
+> 当前版本：v0.20（版本号统一由 `Config.mqh` 的 `GTEA_VERSION` 定义；框架+出场增强+健壮性优化阶段产出，**非完整可交易版本**）
 
 ## 目录结构
 
@@ -11,7 +11,7 @@ GoldTrendEA/
 │   └── GoldTrendEA.mq5            # 主 EA：OnInit/OnTick/OnDeinit/OnTradeTransaction
 ├── Include/
 │   └── GoldTrendEA/
-│       ├── Config.mqh             # 29 项 input 参数 + 公共枚举（方案 4.5 节参数表 + InpLogKeepDays 日志保留天数）
+│       ├── Config.mqh             # 全部 input 参数 + 公共枚举/常量（方案 4.5 节参数表 + 版本宏 GTEA_VERSION/心跳/保证金阈值等）
 │       ├── Logger.mqh             # 日志与通知：分级日志/WARN节流/手机推送（方案 8.3）
 │       ├── MarketData.mqh         # 行情数据层：新K线判定/OHLC/点差/环境校验（方案 6.1/6.5）
 │       ├── Indicators.mqh         # 指标计算层：句柄管理/CopyBuffer/唐奇安（方案 6.2）
@@ -29,10 +29,10 @@ GoldTrendEA/
 | Logger | `CLogger` | 无 | `Info/Warn/Error/WarnThrottled/Notify` |
 | MarketData | `CMarketData` | Logger | `IsNewBar/Close/SpreadPoints/IsTradingEnvironmentOK` |
 | Indicators | `CIndicators` | Logger | `Init(句柄创建)/Release/GetValue/DonchianUpper·Lower/AtrSig` |
-| SignalEngine | `CSignalEngine` | MarketData, Indicators | `Evaluate() → BUY/SELL/NONE`、`IsTrendReversed` |
-| PositionManager | `CPositionManager` | Logger | `CanOpenNew/CountMyPositions/SyncWithReality/OnPositionClosed/RestoreState` |
-| RiskManager | `CRiskManager` | Logger | `CalcLots/IsHalted/SpreadOk/IsFridayCloseTime/OnTradeResult` |
-| TradeExecutor | `CTradeExecutor` | Logger | `Open(重试)/CloseMyPosition/ModifySL/ApplyBreakEven/ApplyAtrTrailing` |
+| SignalEngine | `CSignalEngine` | MarketData, Indicators | `Evaluate/EvaluateCached(同K线缓存) → BUY/SELL/NONE`、`IsTrendReversed(含反向三重信号)` |
+| PositionManager | `CPositionManager` | Logger, RiskManager(可选注入) | `CanOpenNew/CountMyPositions(Tick级缓存)/InvalidateCache/SyncWithReality(兜底盈亏回查)/OnPositionClosed(差异化冷却)/RestoreState/UpdateHeartbeat/单笔持仓级持久化(初始止损距离/保本标记)` |
+| RiskManager | `CRiskManager` | Logger | `CalcLots/IsHalted/SpreadOk/IsFridayCloseTime/OnTradeResult/LastDealTicket` |
+| TradeExecutor | `CTradeExecutor` | Logger | `Open(重试+一单一结二次校验)/CloseMyPosition/ModifySL`（保本/跟踪策略在主 EA 的 `ManagePosition` 中实现） |
 
 依赖注入均在主 EA 的 `OnInit` 中完成（指针注入），各模块之间不直接互相构造。
 
@@ -44,27 +44,41 @@ GoldTrendEA/
 4. 在 MetaEditor 中打开 `GoldTrendEA.mq5` 按 F7 编译；
 5. 编译通过后在 MT5 中将 EA 拖到 XAUUSD H1 图表（任意周期均可运行，H1 与内部 `InpSignalTF` 一致最直观），启用「算法交易」。
 
-> 注意：当前为框架版本，可编译、可挂载、可完成"信号评估→开仓→止损止盈→平仓→冷却"的基本闭环，但保本推损/ATR 跟踪/结构点止损等仍为 TODO 骨架，**请勿用于实盘**。
+> 注意：保本推损/ATR+结构点跟踪止损/反向三重信号离场等核心出场功能已实现（第二批 G1~G5/G7/G10），但尚未经方案 7.1 配置的全量回测与模拟盘验证，**请勿用于实盘**。
 
-> 运维提示（日志参数）：VPS 长期运行时请按磁盘容量设置 `InpLogKeepDays`（建议 30/60/90 天，超期旧日志自动清理）；若回测或实盘出现「单日日志超 50MB」WARN，应精简日志级别或提高 `WarnThrottled` 节流窗口。
+> 运维提示（日志参数）：VPS 长期运行时请按磁盘容量设置 `InpLogKeepDays`（建议 30/60/90 天，超期旧日志自动清理）；若回测或实盘出现「单日日志超 50MB」WARN，应精简日志级别或提高 `WarnThrottled` 节流窗口。信号逐层未通过的 Info 日志默认关闭，调试/复盘时开启 `InpVerboseSignalLog` 可附 EMA/ADX/MACD/唐奇安关键数值。
+
+> 运维提示（心跳监控）：EA 每 5 分钟写一次心跳全局变量 `GTEA_<magic>_<symbol>_HEARTBEAT`（值为最近写入时的服务器时间戳），外部看门狗脚本可据此监控 EA 存活（长时间未更新 = EA 已停/终端断线，注意周末无 Tick 时心跳也会暂停）。
+
+## v0.10 → v0.20 升级注意事项
+
+从 v0.10 升级到 v0.20 前请逐项确认：
+
+1. **`InpCooldownBars` 已拆分为两个参数**（G5）：亏损平仓用 `InpCooldownBarsLoss`、盈利/保本平仓用 `InpCooldownBarsProfit`（默认均为 3，与旧默认行为一致）。旧版 `.set` 配置文件中的 `InpCooldownBars` 不会自动迁移，需手动改为新参数名并重新保存；
+2. **`InpUseBreakEven` / `InpUseTrailing` 默认启用**（属方案 4.4 核心出场功能）：升级后持仓管理行为与 v0.10（TODO 骨架、实际不生效）不同，不需要的用户请手动关闭；实盘前建议先按方案 7.1 配置回测验证出场参数；
+3. **全局变量命名空间加入了 symbol**（`GTEA_<magic>_<symbol>_*`）：旧命名空间（仅 magic）的风控/冷却状态不会被继承，升级后日/周亏损、连亏计数与冷却从零开始累积，必要时手动清理旧全局变量（前缀 `GTEA_<magic>_`）；
+4. **升级首日熔断基数按当前净值快照**：日/周亏损熔断的基数在首次启动时取当前净值补快照（而非当日 0 点/周初净值），若当日已有盈亏，首日熔断阈值会有偏差，次日跨日复位后自动回归正常；同理最后已入账成交基准（LAST_DEAL）首次启动时按历史成交最大 ticket 初始化，历史旧成交不会被补记入风控统计；
+5. **`InpVerboseSignalLog` 默认关闭**：信号逐层未通过原因的详细日志不再默认输出，需要诊断/复盘时手动开启；
+6. **`OnTester` 新增复合优化指标**（PF × √交易数 ÷ 最大相对回撤%）：新旧版本的优化结果排序口径不同，**不可直接对比**，历史优化结论需用新指标重跑；
+7. **建议在非交易时段（周末）升级**，并先在模拟盘验证至少一个完整交易周期后再考虑实盘（当前版本本身仍**不建议实盘**，见上方注意）。
 
 ## 后续开发待办（TODO 清单）
 
 按方案文档里程碑推进，代码内均有 `TODO(阶段, 方案章节)` 标注：
 
 ### M2 策略信号实现
-- [ ] `SignalEngine::IsTrendReversed`：条件二「完整反向三重信号」——复用 `Evaluate()` 并缓存本根 K 线评估结果，避免重复计算（方案 4.4）
-- [ ] `GoldTrendEA.mq5::TryOpenPosition`：结构点止损候选 —— `SwingLow/SwingHigh` 外加缓冲，与 ATR 距离取 max（方案 4.4）
+- [x] `SignalEngine::IsTrendReversed`：条件二「完整反向三重信号」——复用 `EvaluateCached()` 同K线缓存评估结果，避免重复计算（方案 4.4，G4 已实现）
+- [x] `GoldTrendEA.mq5::TryOpenPosition`：结构点止损候选 —— `SwingLow/SwingHigh` 外加缓冲（`GTEA_SWING_SL_BUFFER_ATR` × ATR），与 ATR 距离取 max（方案 4.4，G3 初始止损路径已实现；跟踪路径早已含结构点）
 
 ### M3 风控与出场完善
-- [ ] `TradeExecutor::ApplyBreakEven`：保本推损完整实现；需要在开仓时把**初始止损距离**持久化到全局变量（保本后 `pos.StopLoss()` 已变化）（方案 4.4）
-- [ ] `TradeExecutor::ApplyAtrTrailing`：ATR 跟踪止损完整实现，含 `InpTrailReplacesTP` 风格开关（方案 4.4）
-- [ ] `PositionManager::StartCooldown`：亏损/盈利平仓差异化冷却长度（方案 4.3）
-- [ ] `PositionManager::RestoreState`：重连后首个 Tick 全量对账（SL/TP 与预期一致性校验）（方案 8.2）
+- [x] 保本推损完整实现（主 EA `ApplyBreakEven`，初始止损距离开仓时持久化，保本只推一次）（方案 4.4，G1）
+- [x] ATR+结构点跟踪止损（主 EA `ApplyTrailingStop`，含 `InpTrailReplacesTP` 风格开关）（方案 4.4，G2/G3）
+- [x] `PositionManager::StartCooldown`：亏损/盈利平仓差异化冷却长度（方案 4.3，G5）
+- [x] 重连后 SL/TP 对账（主 EA `ReconcileRestoredStops`，SL 缺失按持久化初始止损距离重建）（方案 8.2，G10）
 - [ ] `RiskManager::IsNewsBlackout`：新闻时段过滤（手工时间表或经济日历接入，P2 可选）（方案 5.2）
 
 ### M4 回测与优化（方案第 7 章）
-- [ ] 自定义 `OnTester` 复合优化指标（PF × 回撤组合）
+- [x] 自定义 `OnTester` 复合优化指标（PF × √交易数 ÷ 最大相对回撤%，G7）
 - [ ] MACD「零轴位置约束」优化开关对比（`SignalEngine::MomentumOk` 内 TODO）
 
 ### P2 增强项
@@ -74,11 +88,13 @@ GoldTrendEA/
 
 ## 关键设计约定（开发时必须遵守）
 
-- **一单一结不变量**：任何开仓路径必须先经 `CPositionManager::CanOpenNew()`（内部含真实持仓核对）；
+- **一单一结不变量**：任何开仓路径必须先经 `CPositionManager::CanOpenNew()`（内部含真实持仓核对）；`CTradeExecutor::Open()` 发送前另有防御性二次持仓校验（A1，最后一道防线）；
+- **持仓查询 Tick 级缓存**（D1）：`CountMyPositions/HasPosition` 同一 Tick 内复用缓存，`OnTick` 顶部已统一失效；**新增任何开/平仓路径后必须调用 `InvalidateCache()`** 避免脏读；
 - **真实持仓为唯一事实来源**：新增状态流转逻辑时，勿只依赖内存状态，参考 `SyncWithReality()`（注：OPENING 态无持仓属正常，由主 EA 的 Tick 驱动重试分支处理）；
 - **信号只用已收盘 K 线**（index ≥ 1），杜绝未来函数；
 - **风控红线参数**（`InpDailyLossPct/InpWeeklyLossPct/InpRiskPercent`）不参与优化；
 - 全局变量持久化统一使用各模块 Init 时生成的**实例级前缀** `"GTEA_"+magic+"_"+symbol+"_"`（magic+symbol 组合命名空间，避免多图表同 magic 时冷却/风控状态跨品种污染）；
 - **多品种/多图表挂载必须为每个实例配置不同的 `InpMagic`**（OnInit 对默认 magic 有防呆 Warn）；如需账户级统一熔断，属后续单独设计（见 TODO 清单 P2）；
-- **升级兼容说明**：从旧版本（仅按 magic 命名空间）升级到当前版本时，熔断与冷却的持久化命名空间已变为 magic+symbol，**历史状态不会被继承**——升级后当日/本周风控统计与冷却将从 0 重新累积，建议在非交易时段升级，必要时手动清理旧全局变量（前缀 `GTEA_<magic>_`）；
-- **`STATE_OPENING` 语义**：表示已触发开仓流程、等待 Tick 驱动重试结果的状态，该状态下**可能暂时无真实持仓**，由 `OnTick` 的 `RetryOpenPosition()` 分支负责最终转为 `POSITION_OPEN` 或回退 `IDLE`；后续开发不要将「OPENING + 无持仓」当作异常处理。
+- **升级兼容说明**：从旧版本（仅按 magic 命名空间）升级到当前版本时，熔断与冷却的持久化命名空间已变为 magic+symbol，**历史状态不会被继承**——升级后当日/本周风控统计与冷却将从 0 重新累积，建议在非交易时段升级，必要时手动清理旧全局变量（前缀 `GTEA_<magic>_`）；注意全局变量名上限 63 字符，magic+品种组合过长时会被终端截断（E5 已加超长 ERROR 告警）；
+- **版本号维护**（F1）：升版时同步修改 `Config.mqh` 的 `GTEA_VERSION` 与主 EA 的 `#property version`（MQL5 的 `#property` 不支持宏展开，无法直接引用宏）；
+- **`STATE_OPENING` 语义**：表示已触发开仓流程、等待 Tick 驱动重试结果的状态，该状态下**可能暂时无真实持仓**，由 `OnTick` 的 `RetryOpenPosition()` 分支负责最终转为 `POSITION_OPEN` 或回退 `IDLE`；后续开发不要将「OPENING + 无持仓」当作异常处理；重启后恢复到持久化的 OPENING（待重试参数已丢失）时由 `RestoreState` 直接归为 `IDLE`（E1）。

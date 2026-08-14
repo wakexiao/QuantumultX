@@ -30,14 +30,60 @@ private:
    datetime          m_pauseUntil;         // 连亏暂停截止时间（0=未暂停）
    int               m_lastResetDay;       // 上次日复位的"天"标识
    int               m_lastResetWeek;      // 上次周复位的"周"标识
+   ulong             m_lastDealTicket;     // 修复E2：最后已入账平仓成交 ticket（离线补账防重复）
    string            m_gvPrefix;           // 修复一：实例级持久化前缀 magic+symbol
+   bool              m_gvNameWarned;       // E5：全局变量名超长只告警一次（防刷屏）
 
    //--- 修复一：改用 magic+symbol 实例级前缀，避免多图表同 magic 挂载时
    //    风控统计（日/周亏损、连亏计数）跨品种污染
-   string            GVName(const string suffix) { return m_gvPrefix + "RISK_" + suffix; }
+   //    E5：MT5 全局变量名上限 63 字符，超长会被终端截断导致命名冲突，
+   //    记 ERROR 暴露问题（仍返回原名交由终端截断，日志用于提醒缩短组合）
+   string            GVName(const string suffix)
+     {
+      string name = m_gvPrefix + "RISK_" + suffix;
+      if(StringLen(name) > GTEA_GV_NAME_MAX && !m_gvNameWarned)
+        {
+         m_gvNameWarned = true;
+         m_logger.Error(StringFormat("全局变量名超长(%d>%d): %s, 将被终端截断, 请缩短 magic/品种组合",
+                                     StringLen(name), GTEA_GV_NAME_MAX, name));
+        }
+      return name;
+     }
 
    //--- 当前服务器时间结构
    void              NowStruct(MqlDateTime &dt) { TimeToStruct(TimeCurrent(), dt); }
+
+   //--- 评审九：LAST_DEAL 冷启动初始化 —— 首次运行/升级换命名空间后无
+   //    持久化记录时，从历史成交（本 magic+品种）回查最大 deal ticket
+   //    作为入账基准，避免升级首日离线补账/兜底补账误把历史旧成交
+   //    记入当日风控统计
+   void              InitLastDealFromHistory()
+     {
+      if(!HistorySelect(0, TimeCurrent() + 60))
+        {
+         m_logger.Warn("冷启动: HistorySelect 失败, LAST_DEAL 基准未初始化, 补账路径可能误记历史成交");
+         return;
+        }
+      ulong maxTicket = 0;
+      int   total     = HistoryDealsTotal();
+      for(int i = 0; i < total; i++)
+        {
+         ulong deal = HistoryDealGetTicket(i);
+         if(deal == 0 || deal <= maxTicket)
+            continue;
+         if(HistoryDealGetInteger(deal, DEAL_MAGIC) != m_magic)
+            continue;
+         if(HistoryDealGetString(deal, DEAL_SYMBOL) != m_symbol)
+            continue;
+         maxTicket = deal;
+        }
+      if(maxTicket > 0)
+        {
+         m_lastDealTicket = maxTicket;
+         SaveState();
+         m_logger.Info(StringFormat("冷启动: LAST_DEAL 无持久化记录, 按历史成交初始化入账基准 ticket=%I64u", maxTicket));
+        }
+     }
 
 public:
                      CRiskManager() : m_symbol(""), m_magic(0), m_logger(NULL),
@@ -45,7 +91,8 @@ public:
                                       m_dailyLoss(0), m_weeklyLoss(0),
                                       m_consecLosses(0), m_pauseUntil(0),
                                       m_lastResetDay(-1), m_lastResetWeek(-1),
-                                      m_gvPrefix("") {}
+                                      m_lastDealTicket(0), m_gvPrefix(""),
+                                      m_gvNameWarned(false) {}
                     ~CRiskManager() {}
 
    //--- 初始化：绑定 magic/品种/日志并恢复持久化的熔断状态
@@ -57,6 +104,25 @@ public:
       m_logger = logger;
       m_gvPrefix = "GTEA_" + (string)m_magic + "_" + m_symbol + "_";
       LoadState();
+      // 评审九：LAST_DEAL 全局变量不存在（冷启动）时从历史成交初始化
+      //     入账基准，避免升级首日补账路径的边界漏记/误记
+      if(!GlobalVariableCheck(GVName("LAST_DEAL")))
+         InitLastDealFromHistory();
+      // B2：风控基数兜底快照 —— 首次运行/全局变量被清时无持久化基数，
+      //     若等到 CheckPeriodReset 跨日/跨周才快照，当日熔断阈值只能回退
+      //     临时取当前净值（IsHalted 内的兜底分支），此处主动补快照固化
+      if(m_dailyBaseEquity <= 0 || m_weeklyBaseEquity <= 0)
+        {
+         double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+         if(m_dailyBaseEquity <= 0)
+            m_dailyBaseEquity = equity;
+         if(m_weeklyBaseEquity <= 0)
+            m_weeklyBaseEquity = equity;
+         if(m_logger != NULL)
+            m_logger.Info(StringFormat("风控基数补快照: 日基数=%.2f 周基数=%.2f",
+                                       m_dailyBaseEquity, m_weeklyBaseEquity));
+         SaveState();
+        }
       return (m_magic != 0 && m_symbol != "" && m_logger != NULL);
      }
 
@@ -103,10 +169,22 @@ public:
                                     lots, lotMin));
          return 0.0;
         }
-      return NormalizeDouble(lots, 2);
+      // 修复B1：按 VOLUME_STEP 动态计算手数小数位（lotStep=0.01→2位、
+      //         0.1→1位、1→0位），避免固定 2 位与品种步长不符产生非法手数
+      // 评审七：lotStep 异常（非法数值/超常规范围）时 MathLog10 结果不可信，
+      //         校验有效性与 [0,8] 合理范围，异常回退默认 2 位
+      int lotDigits = 2;
+      if(lotStep > 0)
+        {
+         double digitsRaw = -MathLog10(lotStep);
+         if(MathIsValidNumber(digitsRaw) && digitsRaw >= 0 && digitsRaw <= 8)
+            lotDigits = (int)MathRound(digitsRaw);
+        }
+      return NormalizeDouble(lots, lotDigits);
      }
 
-   //--- 保证金校验：开仓占用 <= 可用保证金的 50%（方案 5.1）
+   //--- 保证金校验：开仓占用 <= 可用保证金的 InpMaxMarginUsePct%（方案 5.1，
+   //    F2：原硬编码 50% 提取为 input）
    bool              MarginOk(const ENUM_ORDER_TYPE type, const double lots, const double price)
      {
       double marginNeed = 0.0;
@@ -116,10 +194,10 @@ public:
          return false;
         }
       double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
-      if(marginNeed > freeMargin * 0.5)
+      if(marginNeed > freeMargin * InpMaxMarginUsePct / 100.0)
         {
-         m_logger.Warn(StringFormat("保证金校验: 需 %.2f > 可用 %.2f 的50%%, 放弃开仓",
-                                    marginNeed, freeMargin));
+         m_logger.Warn(StringFormat("保证金校验: 需 %.2f > 可用 %.2f 的%.0f%%, 放弃开仓",
+                                    marginNeed, freeMargin, InpMaxMarginUsePct));
          return false;
         }
       return true;
@@ -193,10 +271,14 @@ public:
 
    //=== 盈亏统计与周期复位（方案 5.2 / 6.6）===========================
 
-   //--- 成交回报回调：由 OnTradeTransaction 的 DEAL_ENTRY_OUT 驱动
-   //    profit 应为 DEAL_PROFIT + DEAL_SWAP + DEAL_COMMISSION 之和
-   void              OnTradeResult(const double profit)
+   //--- 成交回报回调：由 OnTradeTransaction 的 DEAL_ENTRY_OUT 驱动，
+   //    离线补账（修复E2）时也由主 EA 回查历史后补调
+   //    profit 应为 DEAL_PROFIT + DEAL_SWAP + DEAL_COMMISSION 之和；
+   //    dealTicket 非 0 时登记为最后已入账成交，供离线补账防重复
+   void              OnTradeResult(const double profit, const ulong dealTicket = 0)
      {
+      if(dealTicket > 0 && dealTicket > m_lastDealTicket)
+         m_lastDealTicket = dealTicket;
       if(profit < 0)
         {
          m_dailyLoss  += -profit;
@@ -219,10 +301,23 @@ public:
       SaveState();
      }
 
+   //--- 修复E2：最后已入账平仓成交 ticket（离线补账去重用，只读）
+   ulong             LastDealTicket() const { return m_lastDealTicket; }
+
    //--- 周期复位检查：每 Tick 轻量调用；跨日/跨周时复位统计并快照基数
    //    （方案 5.2：基数在每日/每周首次交易前快照，熔断次日/下周一自动复位）
    void              CheckPeriodReset()
      {
+      // 修复B3：连亏暂停到期后清零连亏计数并复位暂停时间，同步持久化；
+      //         否则恢复交易后首笔亏损会基于旧计数立即再次触发暂停
+      if(m_pauseUntil > 0 && TimeCurrent() >= m_pauseUntil)
+        {
+         m_logger.Info(StringFormat("连亏暂停到期: 清零连亏计数(原 %d 笔), 恢复开仓评估",
+                                    m_consecLosses));
+         m_consecLosses = 0;
+         m_pauseUntil   = 0;
+         SaveState();
+        }
       MqlDateTime dt;
       NowStruct(dt);
       // 跨日复位（服务器时间 0 点后首个 Tick）
@@ -258,6 +353,7 @@ public:
       GlobalVariableSet(GVName("PAUSE_UNTIL"),  (double)m_pauseUntil);
       GlobalVariableSet(GVName("RESET_DAY"),    (double)m_lastResetDay);
       GlobalVariableSet(GVName("RESET_WEEK"),   (double)m_lastResetWeek);
+      GlobalVariableSet(GVName("LAST_DEAL"),    (double)m_lastDealTicket);   // 修复E2
      }
 
    void              LoadState()
@@ -270,6 +366,7 @@ public:
       if(GlobalVariableCheck(GVName("PAUSE_UNTIL")))  m_pauseUntil      = (datetime)GlobalVariableGet(GVName("PAUSE_UNTIL"));
       if(GlobalVariableCheck(GVName("RESET_DAY")))    m_lastResetDay    = (int)GlobalVariableGet(GVName("RESET_DAY"));
       if(GlobalVariableCheck(GVName("RESET_WEEK")))   m_lastResetWeek   = (int)GlobalVariableGet(GVName("RESET_WEEK"));
+      if(GlobalVariableCheck(GVName("LAST_DEAL")))    m_lastDealTicket  = (ulong)GlobalVariableGet(GVName("LAST_DEAL"));   // 修复E2
      }
   };
 

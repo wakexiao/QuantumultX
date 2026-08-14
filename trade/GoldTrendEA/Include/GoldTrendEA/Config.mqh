@@ -2,10 +2,16 @@
 //|                                                       Config.mqh |
 //|  模块职责：EA 全部 input 参数集中定义 + 公共枚举/常量               |
 //|  对应方案文档：第 4.5 节「可调参数总表」（28 项参数一一对应）+     |
-//|               日志保留天数 InpLogKeepDays（修复四新增）              |
+//|               日志保留天数 InpLogKeepDays（修复四新增）+            |
+//|               出场增强开关与差异化冷却（第二批 G1/G2/G5 新增）+      |
+//|               版本宏/心跳/保证金阈值等（第三批 F1/F2/F5 新增）       |
 //+------------------------------------------------------------------+
 #ifndef __GTEA_CONFIG_MQH__
 #define __GTEA_CONFIG_MQH__
+
+//--- F1：EA 版本号统一定义（日志头等处引用；#property version 不支持
+//    宏展开，主 EA 中的 #property 需随本宏同步手工更新）
+#define GTEA_VERSION  "0.20"
 
 //--- 信号方向枚举（信号引擎输出）
 enum ENUM_SIGNAL_DIR
@@ -44,17 +50,23 @@ input int               InpATR_Period       = 14;         // ATR 周期（不优
 input double            InpSL_ATR_Mult      = 2.0;        // 止损 ATR 倍数（优化 1.5~3.0 步长0.25）
 input int               InpSwingBars        = 10;         // 结构点回溯根数（优化 5~20 步长5）
 input double            InpRR               = 1.8;        // 固定盈亏比（优化 1.2~2.5 步长0.2）
+input bool              InpUseBreakEven     = true;       // 启用保本推损（G1，方案 4.4 默认启用）
 input double            InpBE_Trigger       = 1.0;        // 保本触发/倍止损距离（优化 0.6~1.5）
 input double            InpBE_Offset        = 0.3;        // 保本偏移/美元（优化 0~1.0）
+input bool              InpUseTrailing      = true;       // 启用ATR+结构点跟踪止损（G2/G3，方案 4.4 默认启用）
 input double            InpTrail_ATR_Mult   = 2.5;        // 跟踪止损 ATR 倍数（优化 1.5~3.5 步长0.5）
 input bool              InpTrailReplacesTP  = false;      // 跟踪启动后取消固定TP（风格对比开关）
 
 //=== 一单一结机制（方案 4.3）========================================
-input int               InpCooldownBars     = 3;          // 平仓后冷却 K 线数/H1（优化 0~10）
+//    G5：原单一 InpCooldownBars 拆分为亏损/盈利差异化冷却（方案 4.3
+//    「亏损平仓与盈利平仓可配置不同冷却长度」，默认相同）
+input int               InpCooldownBarsLoss   = 3;        // 亏损平仓冷却 K 线数/H1（G5，优化 0~10）
+input int               InpCooldownBarsProfit = 3;        // 盈利/保本平仓冷却 K 线数/H1（G5，可为 0）
 
 //=== 资金管理与风控（方案 5 章，红线项不参与优化）====================
 input double            InpRiskPercent      = 1.0;        // 单笔风险 %（实盘固定 ≤1）
 input double            InpMaxLots          = 1.0;        // 最大手数上限（按账户规模定）
+input double            InpMaxMarginUsePct  = 50.0;       // 开仓保证金占用上限/%可用保证金（F2，原硬编码50%）
 input double            InpDailyLossPct     = 3.0;        // 日亏损熔断 %（风控红线，不优化）
 input double            InpWeeklyLossPct    = 6.0;        // 周亏损熔断 %（风控红线，不优化）
 input int               InpMaxConsecLoss    = 4;          // 最大连亏次数（优化 3~6）
@@ -68,6 +80,19 @@ input int               InpSlippagePoints   = 30;         // 最大滑点/点（
 
 //=== 日志与运维（修复四：日志容量与保留策略）=======================
 input int               InpLogKeepDays      = 30;         // 日志保留天数（超期旧日志自动清理）
+input bool              InpVerboseSignalLog = false;      // 信号评估详细日志：逐层未通过原因+指标数值（D2/F4）
+
+//=== 执行常量（修复C2/A2/E2 新增，非优化项故用宏而非 input）=========
+#define GTEA_CLOSE_MAX_ATTEMPTS      3              // 平仓失败单次调用内最大立即重试次数（修复C2）
+#define GTEA_CLOSE_RETRY_SLEEP_MS    300            // 平仓重试间退避/毫秒（评审五：Sleep 在测试器中被忽略，实盘避免同 Tick 内连发轰炸）
+#define GTEA_SWING_SL_BUFFER_ATR     0.25           // 初始止损结构点缓冲/ATR 倍数（G3，方案 4.4「结构点外加缓冲」）
+#define GTEA_OPEN_MAX_ATTEMPTS       3              // 开仓可重试错误累计最大尝试次数（F2，原硬编码3）
+#define GTEA_RETRY_MIN_INTERVAL_SEC  1              // 开仓重试最小间隔/秒（F2，原硬编码1秒，防轰炸服务器）
+#define GTEA_OPEN_RETRY_TIMEOUT_SEC  30             // 开仓重试超时窗口/秒，超时放弃回 IDLE（修复A2）
+#define GTEA_RECONCILE_LOOKBACK_SEC  (7 * 24 * 3600) // 离线补账缺省回查窗口/秒（修复E2，覆盖周末跳空）
+#define GTEA_SYNC_LOOKBACK_SEC       (24 * 3600)    // 状态对账兜底盈亏回查窗口/秒（A3，持仓消失刚发生，24h 足够）
+#define GTEA_HEARTBEAT_INTERVAL_SEC  (5 * 60)       // 心跳全局变量刷新间隔/秒（F5，供外部看门狗监控）
+#define GTEA_GV_NAME_MAX             63             // MT5 全局变量名长度上限（E5，超长将被终端截断）
 
 //--- 全局变量（状态持久化）命名（方案 6.6）：
 //    修复一：前缀不再使用仅含 magic 的宏，改由各模块 Init(magic, symbol)

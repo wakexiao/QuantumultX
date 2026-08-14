@@ -1,0 +1,1738 @@
+diff --git a/trade/GoldTrendEA/Experts/GoldTrendEA.mq5 b/trade/GoldTrendEA/Experts/GoldTrendEA.mq5
+index b4bdd75..556bd9d 100644
+--- a/trade/GoldTrendEA/Experts/GoldTrendEA.mq5
++++ b/trade/GoldTrendEA/Experts/GoldTrendEA.mq5
+@@ -8,7 +8,9 @@
+ //+------------------------------------------------------------------+
+ #property copyright "GoldTrendEA Project"
+ #property link      ""
+-#property version   "0.10"
++// F1：版本号与 Config.mqh 的 GTEA_VERSION 保持同步（#property 不支持
++//     宏展开，升版时两处同步修改）
++#property version   "0.20"
+ #property description "顺势一单一结 EA 框架：H4趋势+H1三重过滤，同一时刻最多1单"
+ #property strict
+ 
+@@ -31,10 +33,13 @@ CRiskManager      g_risk;
+ CTradeExecutor    g_executor;
+ 
+ //--- 修复三：OPENING 态待重试的开仓参数（Tick 驱动非阻塞重试用）
+-ENUM_SIGNAL_DIR   g_pendingDir  = SIGNAL_NONE;
+-double            g_pendingLots = 0.0;
+-double            g_pendingSL   = 0.0;
+-double            g_pendingTP   = 0.0;
++//    修复A2：不再缓存首次计算的 SL/TP 绝对价（重试时已过期），
++//    改存止损距离，重试时基于当前 Ask/Bid 重算；并记录首次尝试时刻
++//    用于重试超时判定
++ENUM_SIGNAL_DIR   g_pendingDir      = SIGNAL_NONE;
++double            g_pendingLots     = 0.0;
++double            g_pendingSLDist   = 0.0;   // 首次计算的 ATR 止损距离（修复A2）
++datetime          g_pendingFirstTry = 0;     // 首次下单尝试时刻（修复A2 超时用）
+ 
+ //+------------------------------------------------------------------+
+ //| OnInit：环境校验 → 模块初始化与依赖注入 → 状态恢复                 |
+@@ -44,7 +49,7 @@ int OnInit()
+    //--- 1. 日志模块最先初始化（其余模块依赖它）
+    if(!g_logger.Init(InpMagic))
+       return INIT_FAILED;
+-   g_logger.Info("========== GoldTrendEA v0.10 初始化 ==========");
++   g_logger.Info("========== GoldTrendEA v" + GTEA_VERSION + " 初始化 ==========");   // F1：版本号统一引用
+    g_logger.Info(StringFormat("品种=%s 趋势周期=%s 信号周期=%s magic=%I64d",
+                               _Symbol, EnumToString(InpTrendTF),
+                               EnumToString(InpSignalTF), InpMagic));
+@@ -81,12 +86,22 @@ int OnInit()
+      { g_logger.Error("CPositionManager 初始化失败");  return INIT_FAILED; }
+    if(!g_risk.Init(InpMagic, _Symbol, &g_logger))   // 修复一：传入 magic 生成实例级持久化前缀
+      { g_logger.Error("CRiskManager 初始化失败");  return INIT_FAILED; }
++   //--- A3：注入风控模块，供 SyncWithReality 兜底路径回查盈亏后补风控统计
++   g_posMgr.SetRiskManager(&g_risk);
+    if(!g_executor.Init(_Symbol, InpMagic, InpSlippagePoints, &g_logger))
+      { g_logger.Error("CTradeExecutor 初始化失败");  return INIT_FAILED; }
+ 
+-   //--- 5. 状态恢复：存量持仓 > 全局变量冷却 > IDLE（方案 4.3 / 8.2）
++   //--- 5. 修复E2：离线成交补账 —— 离线期间持仓被服务器平掉（周末跳空
++   //    触发 SL 等）时 OnTradeTransaction 不会补发，需回查历史补记风控统计
++   ReconcileOfflineDeals();
++
++   //--- 6. 状态恢复：存量持仓 > 全局变量冷却 > IDLE（方案 4.3 / 8.2）
+    g_posMgr.RestoreState();
+ 
++   //--- 7. G10：重连对账 —— 恢复到 POSITION_OPEN 时校验持仓 SL/TP
++   //    存在性与方向，SL 缺失时按持久化的初始止损距离重建（方案 8.2）
++   ReconcileRestoredStops();
++
+    g_logger.Notify("EA 启动完成, 当前状态机就绪");
+    return INIT_SUCCEEDED;
+   }
+@@ -107,6 +122,11 @@ void OnDeinit(const int reason)
+ //+------------------------------------------------------------------+
+ void OnTick()
+   {
++   //--- D1：每 Tick 开始失效持仓计数缓存（同一 Tick 内后续查询复用）
++   g_posMgr.InvalidateCache();
++   //--- F5：心跳全局变量（每 5 分钟写一次，供外部看门狗监控 EA 存活）
++   g_posMgr.UpdateHeartbeat();
++
+    //--- ① 交易环境校验（失败节流告警并返回）
+    if(!g_market.IsTradingEnvironmentOK())
+       return;
+@@ -120,7 +140,10 @@ void OnTick()
+      {
+       if(g_posMgr.HasPosition())
+         {
++         // 修复C2：先进 CLOSING 态再平仓，失败时后续 Tick 可继续重试
++         g_posMgr.SetState(STATE_CLOSING);
+          g_executor.CloseMyPosition("周五收盘离场");
++         g_posMgr.InvalidateCache();       // D1：平仓动作后失效缓存防脏读
+          // 平仓成交回报将由 OnTradeTransaction 驱动状态机进入冷却
+         }
+       // 修复三：离场时段放弃待重试的开仓，避免 OPENING 态滞留
+@@ -132,6 +155,14 @@ void OnTick()
+    //--- ④ 有持仓 → 仅执行持仓管理（熔断激活时同样只管理存量持仓）
+    if(g_posMgr.HasPosition())
+      {
++      // 修复C2：CLOSING 态下持仓仍在（此前平仓失败）→ 本 Tick 继续尝试
++      //         平仓直到成功，成交回报由 OnTradeTransaction 驱动进入冷却
++      if(g_posMgr.State() == STATE_CLOSING)
++        {
++         g_executor.CloseMyPosition("CLOSING 态补偿重试");
++         g_posMgr.InvalidateCache();       // D1：平仓动作后失效缓存防脏读
++         return;
++        }
+       ManagePosition();
+       return;
+      }
+@@ -165,7 +196,8 @@ void OnTick()
+       return;
+ 
+    //--- ⑧ 信号引擎评估：三重过滤（方向+动能+突破）
+-   ENUM_SIGNAL_DIR sig = g_signal.Evaluate();
++   //    G4：用带同K线缓存的入口，与持仓期反向信号检测共用评估结果
++   ENUM_SIGNAL_DIR sig = g_signal.EvaluateCached();
+    if(sig == SIGNAL_NONE)
+       return;
+    g_posMgr.SetState(STATE_SIGNAL_CONFIRMED);
+@@ -227,16 +259,19 @@ void TryOpenPosition(const ENUM_SIGNAL_DIR sig)
+    g_posMgr.SetState(STATE_OPENING);
+    if(g_executor.Open(sig, lots, sl, tp, "GTEA"))
+      {
++      g_posMgr.InvalidateCache();          // D1：开仓成功后失效缓存防脏读
+       g_posMgr.SetState(STATE_POSITION_OPEN);
+-      // TODO(M3)：将初始止损距离持久化(全局变量)，供保本推损计算使用
++      // G1：持久化初始止损距离（保本触发基准，EA 重启后可恢复）
++      g_posMgr.SaveInitialSLDist(slDist);
+      }
+    else if(g_executor.IsRetryPending())
+      {
+       // 可重试失败：登记待重试参数，保持 OPENING 由后续 Tick 继续（修复三）
+-      g_pendingDir  = sig;
+-      g_pendingLots = lots;
+-      g_pendingSL   = sl;
+-      g_pendingTP   = tp;
++      // 修复A2：只登记止损距离与首次尝试时刻，重试时按当前价重算 SL/TP
++      g_pendingDir      = sig;
++      g_pendingLots     = lots;
++      g_pendingSLDist   = slDist;
++      g_pendingFirstTry = TimeCurrent();
+      }
+    else
+      {
+@@ -247,18 +282,37 @@ void TryOpenPosition(const ENUM_SIGNAL_DIR sig)
+ 
+ //+------------------------------------------------------------------+
+ //| OPENING 态：Tick 驱动的开仓重试（修复三，替代阻塞式 Sleep 重试）  |
++//|   修复A2：重试时基于当前 Ask/Bid 重算 SL/TP（沿用首次的 ATR 止损  |
++//|   距离），避免沿用过期价格；并增加重试超时窗口，首次尝试后        |
++//|   GTEA_OPEN_RETRY_TIMEOUT_SEC 秒仍未成功则放弃回 IDLE 重走信号评估    |
+ //+------------------------------------------------------------------+
+ void RetryOpenPosition()
+   {
+-   if(g_pendingDir == SIGNAL_NONE)
++   if(g_pendingDir == SIGNAL_NONE || g_pendingSLDist <= 0)
+      {
+       // 无待重试参数（异常兜底，如重启后恢复到 OPENING）：回退待机
+       g_executor.ResetRetry();
+       g_posMgr.SetState(STATE_IDLE);
+       return;
+      }
+-   if(g_executor.Open(g_pendingDir, g_pendingLots, g_pendingSL, g_pendingTP, "GTEA"))
++   //--- 修复A2：重试超时判定，超窗口后放弃本次信号（行情可能已走远）
++   if(TimeCurrent() - g_pendingFirstTry > GTEA_OPEN_RETRY_TIMEOUT_SEC)
++     {
++      CancelPendingOpen(StringFormat("重试超时(超过 %d 秒)", GTEA_OPEN_RETRY_TIMEOUT_SEC));
++      return;
++     }
++   //--- 修复A2：基于当前价重算 SL/TP（复用首次的 ATR 止损距离与盈亏比逻辑），
++   //    止损距离未变故手数风险不变，g_pendingLots 无需重算
++   bool   isBuy = (g_pendingDir == SIGNAL_BUY);
++   double entry = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
++                        : SymbolInfoDouble(_Symbol, SYMBOL_BID);
++   double sl = isBuy ? entry - g_pendingSLDist : entry + g_pendingSLDist;
++   double tp = isBuy ? entry + g_pendingSLDist * InpRR : entry - g_pendingSLDist * InpRR;
++   if(g_executor.Open(g_pendingDir, g_pendingLots, sl, tp, "GTEA"))
+      {
++      g_posMgr.InvalidateCache();          // D1：开仓成功后失效缓存防脏读
++      // G1：重试成功同样持久化初始止损距离（先存再清待重试参数）
++      g_posMgr.SaveInitialSLDist(g_pendingSLDist);
+       ClearPendingOpen();
+       g_posMgr.SetState(STATE_POSITION_OPEN);
+       return;
+@@ -277,10 +331,10 @@ void RetryOpenPosition()
+ //+------------------------------------------------------------------+
+ void ClearPendingOpen()
+   {
+-   g_pendingDir  = SIGNAL_NONE;
+-   g_pendingLots = 0.0;
+-   g_pendingSL   = 0.0;
+-   g_pendingTP   = 0.0;
++   g_pendingDir      = SIGNAL_NONE;
++   g_pendingLots     = 0.0;
++   g_pendingSLDist   = 0.0;
++   g_pendingFirstTry = 0;
+   }
+ 
+ //+------------------------------------------------------------------+
+@@ -295,9 +349,10 @@ void CancelPendingOpen(const string reason)
+   }
+ 
+ //+------------------------------------------------------------------+
+-//| 持仓管理：保本推损 / ATR 跟踪 / 趋势反转离场（方案 4.4）           |
+-//|   Tick 级：保本推损（对触发价敏感）                                |
+-//|   新K线级：ATR 跟踪止损、趋势反转检测（方案 N05 性能要求）         |
++//| 持仓管理：保本推损 / 跟踪止损 / 趋势反转离场（方案 4.4）           |
++//|   Tick 级：保本推损（G1，对触发价敏感）                           |
++//|   新K线级：ATR+结构点跟踪止损（G2/G3）、趋势反转检测（含 G4      |
++//|   反向三重信号）（方案 N05 性能要求）                              |
+ //+------------------------------------------------------------------+
+ void ManagePosition()
+   {
+@@ -305,24 +360,197 @@ void ManagePosition()
+    if(!g_posMgr.SelectMyPosition(pos))
+       return;
+ 
+-   //--- Tick 级：保本推损（骨架接口，M3 实现）
+-   g_executor.ApplyBreakEven(pos);
++   //--- Tick 级：保本推损（G1）
++   bool beMoved = ApplyBreakEven(pos);
+ 
+-   //--- 新 K 线级：ATR 跟踪 + 反转离场
++   //--- 新 K 线级：跟踪止损 + 反转离场
+    if(g_market.IsNewBar(InpSignalTF))
+      {
+-      double atr = 0.0;
+-      if(g_indicators.AtrSig(atr) && atr > 0)
+-         g_executor.ApplyAtrTrailing(pos, atr);
++      //--- 保本刚改过单：重新选中刷新 SL/TP 快照，避免用过期值计算
++      if(beMoved && !g_posMgr.SelectMyPosition(pos))
++         return;
+ 
+-      //--- 趋势反转强制离场（方案 4.4）
++      //--- ATR+结构点跟踪止损（G2/G3）
++      ApplyTrailingStop(pos);
++
++      //--- 趋势反转强制离场（方案 4.4）：H4 排列反转 或 完整反向
++      //    三重信号（G4，评估结果同K线内缓存）
+       int posDir = (pos.PositionType() == POSITION_TYPE_BUY) ? 1 : -1;
+       if(g_signal.IsTrendReversed(posDir))
+         {
+          g_posMgr.SetState(STATE_CLOSING);
+          g_executor.CloseMyPosition("趋势反转强制离场");
++         g_posMgr.InvalidateCache();       // D1：平仓动作后失效缓存防脏读
++        }
++     }
++  }
++
++//+------------------------------------------------------------------+
++//| G1 保本推损（Tick 级，方案 4.4）：浮盈达到 初始止损距离 ×          |
++//|   InpBE_Trigger 时将 SL 推至 入场价 ± InpBE_Offset；只推一次        |
++//|   （持久化标记防重复，重启后不重推）                              |
++//|   返回 true = 本 Tick 执行了推损改单（调用方需刷新持仓快照）       |
++//+------------------------------------------------------------------+
++bool ApplyBreakEven(CPositionInfo &pos)
++  {
++   if(!InpUseBreakEven)
++      return false;
++   if(g_posMgr.IsBreakEvenDone())
++      return false;                        // 保本只推一次（G1）
++
++   //--- 初始止损距离：优先取开仓时持久化值；缺失（如全局变量被清）
++   //    时回退用当前 |入场价-SL|（保本未推过，当前 SL 仍是初始 SL）
++   double slDist = g_posMgr.InitialSLDist();
++   if(slDist <= 0 && pos.StopLoss() > 0)
++      slDist = MathAbs(pos.PriceOpen() - pos.StopLoss());
++   if(slDist <= 0)
++      return false;                        // 无法确定触发基准，跳过
++
++   bool   isBuy = (pos.PositionType() == POSITION_TYPE_BUY);
++   double entry = pos.PriceOpen();
++   double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
++   double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
++   if(bid <= 0 || ask <= 0)
++      return false;
++   double profit = isBuy ? (bid - entry) : (entry - ask);   // 浮盈（价格单位）
++   if(profit < slDist * InpBE_Trigger)
++      return false;                        // 未达保本触发阈值
++
++   double newSL = isBuy ? entry + InpBE_Offset : entry - InpBE_Offset;
++   double curSL = pos.StopLoss();
++   //--- 只朝有利方向：新 SL 须优于当前 SL；且不越过现价（本地预检，
++   //    避免无效改单与告警刷屏）
++   if(isBuy && ((curSL > 0 && newSL <= curSL) || newSL >= bid))
++      return false;
++   if(!isBuy && ((curSL > 0 && newSL >= curSL) || newSL <= ask))
++      return false;
++
++   if(g_executor.ModifySL(pos.Ticket(), newSL, pos.TakeProfit()))
++     {
++      g_posMgr.MarkBreakEvenDone();        // 持久化标记，重启后不重复推
++      g_logger.Notify(StringFormat("保本推损: SL %.2f -> %.2f (浮盈 %.2f 达触发阈值 %.2f)",
++                                   curSL, newSL, profit, slDist * InpBE_Trigger));
++      return true;
++     }
++   return false;                           // 改单失败，下一 Tick 自然重试
++  }
++
++//+------------------------------------------------------------------+
++//| G2/G3 跟踪止损（新 K 线级，方案 4.4 / N05）：                     |
++//|   候选1 = 已收盘价 ∓ ATR × InpTrail_ATR_Mult（G2）                |
++//|   候选2 = 近 InpSwingBars 根已收盘K线结构点（多单 SwingLow /       |
++//|           空单 SwingHigh，G3）                                     |
++//|   取更利于保护利润者（多单 max / 空单 min），只朝有利方向移动；   |
++//|   保本启用时待保本完成后启动（方案 4.4「保本后启动」，且只利动      |
++//|   保证跟踪结果不低于保本位）；InpTrailReplacesTP=true 时跟踪改单     |
++//|   同时取消固定 TP（让利润奔跑）                                   |
++//+------------------------------------------------------------------+
++void ApplyTrailingStop(CPositionInfo &pos)
++  {
++   if(!InpUseTrailing)
++      return;
++   //--- 保本启用时：保本完成后才启动跟踪（保本优先）；保本关闭时独立启动
++   if(InpUseBreakEven && !g_posMgr.IsBreakEvenDone())
++      return;
++
++   double atr = 0.0;
++   if(!g_indicators.AtrSig(atr) || atr <= 0)
++      return;                              // 数据不足静默跳过（方案 6.2）
++   double close = g_market.Close(InpSignalTF, 1);
++   if(close <= 0)
++      return;
++
++   bool   isBuy = (pos.PositionType() == POSITION_TYPE_BUY);
++   double newSL = 0.0;
++   double swing = 0.0;
++   if(isBuy)
++     {
++      newSL = close - atr * InpTrail_ATR_Mult;          // G2：ATR 跟踪候选
++      if(g_indicators.SwingLow(swing, InpSwingBars))    // G3：结构点候选
++         newSL = MathMax(newSL, swing);                 // 多单取更高者（更利于保护利润）
++     }
++   else
++     {
++      newSL = close + atr * InpTrail_ATR_Mult;
++      if(g_indicators.SwingHigh(swing, InpSwingBars))
++         newSL = MathMin(newSL, swing);                 // 空单取更低者
++     }
++
++   double curSL = pos.StopLoss();
++   double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
++   double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
++   //--- 只朝有利方向移动（保本后 curSL 已在保本位，只利动即保证不低于
++   //    保本位）+ 不越过现价（本地预检降噪，如结构点高于现价的急跌场景）
++   if(isBuy && ((curSL > 0 && newSL <= curSL) || newSL >= bid))
++      return;
++   if(!isBuy && ((curSL > 0 && newSL >= curSL) || newSL <= ask))
++      return;
++
++   //--- InpTrailReplacesTP：跟踪启动后取消固定 TP（方案 4.4 风格开关）
++   double tp = InpTrailReplacesTP ? 0.0 : pos.TakeProfit();
++   if(g_executor.ModifySL(pos.Ticket(), newSL, tp))
++      g_logger.Info(StringFormat("跟踪止损: SL %.2f -> %.2f (ATR=%.2f, 结构点=%.2f)%s",
++                                 curSL, newSL, atr, swing,
++                                 (InpTrailReplacesTP && pos.TakeProfit() > 0) ? ", 已取消固定TP" : ""));
++  }
++
++//+------------------------------------------------------------------+
++//| G10 重连对账（OnInit 中 RestoreState 之后调用，方案 8.2）：       |
++//|   恢复到 POSITION_OPEN 时校验持仓 SL/TP 是否存在且方向合理；       |
++//|   SL 缺失 → 按持久化初始止损距离重建（无记录时回退 ATR 距离）；   |
++//|   方向异常 → 告警（不自动修正，留人工裁决）                        |
++//+------------------------------------------------------------------+
++void ReconcileRestoredStops()
++  {
++   if(g_posMgr.State() != STATE_POSITION_OPEN)
++      return;
++   CPositionInfo pos;
++   if(!g_posMgr.SelectMyPosition(pos))
++      return;
++
++   bool   isBuy = (pos.PositionType() == POSITION_TYPE_BUY);
++   double entry = pos.PriceOpen();
++   double sl    = pos.StopLoss();
++   double tp    = pos.TakeProfit();
++   double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
++   double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
++
++   //--- SL 缺失：按持久化的初始止损距离重建（无记录时回退 ATR×倍数）
++   if(sl <= 0)
++     {
++      double dist = g_posMgr.InitialSLDist();
++      if(dist <= 0)
++        {
++         double atr = 0.0;
++         if(g_indicators.AtrSig(atr) && atr > 0)
++            dist = atr * InpSL_ATR_Mult;
++        }
++      if(dist <= 0)
++        {
++         g_logger.Error("重连对账: 持仓 SL 缺失且无法重建(无持久化距离且 ATR 不可用), 请人工处理");
++         return;
+         }
++      double newSL = isBuy ? entry - dist : entry + dist;
++      g_logger.Warn(StringFormat("重连对账: 持仓 SL 缺失, 按初始止损距离 %.2f 重建 SL=%.2f",
++                                 dist, newSL));
++      if(!g_executor.ModifySL(pos.Ticket(), newSL, tp))
++         g_logger.Error("重连对账: SL 重建改单失败, 持仓暂无止损保护, 请人工核对");
++      return;
+      }
++
++   //--- SL 方向校验：多单 SL 应低于 Bid、空单 SL 应高于 Ask（保本后 SL
++   //    可能高于入场价，故以现价为基准而非入场价）
++   if(bid > 0 && ask > 0)
++     {
++      if((isBuy && sl >= bid) || (!isBuy && sl <= ask))
++         g_logger.Warn(StringFormat("重连对账: SL 方向异常(%s SL=%.2f Bid=%.2f Ask=%.2f), 请人工核对",
++                                    isBuy ? "多单" : "空单", sl, bid, ask));
++      //--- TP 方向校验（TP=0 合法：InpTrailReplacesTP 取消 TP 的场景）
++      if(tp > 0 && ((isBuy && tp <= ask) || (!isBuy && tp >= bid)))
++         g_logger.Warn(StringFormat("重连对账: TP 方向异常(%s TP=%.2f), 请人工核对",
++                                    isBuy ? "多单" : "空单", tp));
++     }
++   g_logger.Info(StringFormat("重连对账: 持仓 SL/TP 校验完成 SL=%.2f TP=%.2f", sl, tp));
+   }
+ 
+ //+------------------------------------------------------------------+
+@@ -337,6 +565,10 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
+    //--- 只关心新增成交
+    if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+       return;
++   //--- C3：先确保交易历史已加载，否则 HistoryDealSelect 可能因历史
++   //    缓存未同步而失败漏记（+3600 冗余覆盖服务器时钟偏差）
++   if(!HistorySelect(0, TimeCurrent() + 3600))
++      return;
+    //--- 选中成交单获取详情
+    if(!HistoryDealSelect(trans.deal))
+       return;
+@@ -345,10 +577,16 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
+       return;
+    if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
+       return;
++   //--- D1：本 EA 的成交必然改变持仓状态，失效持仓计数缓存
++   g_posMgr.InvalidateCache();
+    //--- 只处理平仓方向的成交（DEAL_ENTRY_OUT，方案 6.6）
+    long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+    if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
+       return;
++   //--- A3：防重复入账 —— SyncWithReality 兜底补账可能已先行入账该成交
++   //    （成交 ticket 服务器端递增，<= 最后已入账 ticket 即已处理过）
++   if(trans.deal <= g_risk.LastDealTicket())
++      return;
+ 
+    //--- 单笔盈亏 = 利润 + 隔夜费 + 佣金（方案 6.6）
+    double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
+@@ -358,8 +596,97 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
+    g_logger.Info(StringFormat("平仓成交回报: deal=%I64u 盈亏=%.2f", trans.deal, profit));
+ 
+    //--- 风控统计（连亏计数/日周亏损累计/熔断判定）
+-   g_risk.OnTradeResult(profit);
++   //    修复E2：传入 deal ticket 登记为最后已入账成交，供离线补账去重
++   g_risk.OnTradeResult(profit, trans.deal);
+    //--- 状态机：平仓结算 → 冷却期（方案 4.3）
+    g_posMgr.OnPositionClosed(profit);
+   }
++
++//+------------------------------------------------------------------+
++//| 修复E2：离线成交补账（OnInit 中、RestoreState 前调用）           |
++//|   EA 离线期间（如周末跳空触发 SL）持仓被服务器平掉时，重启后     |
++//|   OnTradeTransaction 不会触发，日/周亏损与连亏熔断统计会遗漏。       |
++//|   判定：上次保存状态为 POSITION_OPEN/CLOSING 但当前无本 magic 持仓    |
++//|   → 回查历史成交（magic + 品种 + DEAL_ENTRY_OUT，且 ticket 大于最后   |
++//|   已入账成交防重复）补调 OnTradeResult 并进入冷却                    |
++//+------------------------------------------------------------------+
++void ReconcileOfflineDeals()
++  {
++   ENUM_EA_STATE savedState = g_posMgr.SavedState();
++   if(savedState != STATE_POSITION_OPEN && savedState != STATE_CLOSING)
++      return;                              // 上次停机时非持仓态，无需补账
++   if(g_posMgr.HasPosition())
++      return;                              // 持仓仍在，由 RestoreState 正常接管
++
++   //--- 回查窗口：上次状态保存时刻前移 1 小时冗余；无记录时取缺省窗口
++   datetime from = g_posMgr.StateSavedTime();
++   if(from <= 0)
++      from = TimeCurrent() - GTEA_RECONCILE_LOOKBACK_SEC;
++   else
++      from -= 3600;
++   if(!HistorySelect(from, TimeCurrent() + 60))
++     {
++      g_logger.Warn("离线补账: HistorySelect 失败, 无法回查历史成交, 请人工核对风控统计");
++      return;
++     }
++
++   ulong  lastTicket = g_risk.LastDealTicket();
++   int    found      = 0;
++   double profitSum  = 0.0;
++   int    total      = HistoryDealsTotal();
++   for(int i = 0; i < total; i++)
++     {
++      ulong deal = HistoryDealGetTicket(i);
++      if(deal == 0 || deal <= lastTicket)
++         continue;                         // 已入账过的成交跳过（防重复）
++      if(HistoryDealGetInteger(deal, DEAL_MAGIC) != InpMagic)
++         continue;
++      if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol)
++         continue;
++      long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
++      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
++         continue;
++      //--- 单笔盈亏口径与 OnTradeTransaction 一致（方案 6.6）
++      double profit = HistoryDealGetDouble(deal, DEAL_PROFIT)
++                    + HistoryDealGetDouble(deal, DEAL_SWAP)
++                    + HistoryDealGetDouble(deal, DEAL_COMMISSION);
++      g_logger.Warn(StringFormat("离线补账: 补记平仓成交 deal=%I64u 盈亏=%.2f", deal, profit));
++      g_risk.OnTradeResult(profit, deal);
++      profitSum += profit;
++      found++;
++     }
++
++   if(found > 0)
++     {
++      g_logger.Notify(StringFormat("离线补账完成: 共 %d 笔, 合计盈亏=%.2f, 进入冷却期", found, profitSum));
++      // 进入冷却并持久化，随后 RestoreState 会从全局变量恢复 COOLING_DOWN
++      g_posMgr.OnPositionClosed(profitSum);
++     }
++   else
++      g_logger.Warn("离线补账: 上次状态为持仓但未找到对应平仓成交, 请人工核对历史订单");
++  }
++
++//+------------------------------------------------------------------+
++//| OnTester：自定义复合优化指标（G7/F3，方案 7.2「复合指标」）      |
++//|   适应度 = ProfitFactor × sqrt(总交易数) ÷ max(最大相对回撤%, 1)   |
++//|   奖励高利润因子与充足样本量、惩罚深回撤；无交易/异常返回 0       |
++//+------------------------------------------------------------------+
++double OnTester()
++  {
++   double trades = TesterStatistics(STAT_TRADES);
++   if(trades <= 0)
++      return 0.0;                          // 无交易：无统计意义
++   //--- PF 手工计算：总亏损为 0 时内置 STAT_PROFIT_FACTOR 无定义，
++   //    封顶 100 防无穷大扭曲遗传优化排序
++   double grossProfit = TesterStatistics(STAT_GROSS_PROFIT);
++   double grossLoss   = MathAbs(TesterStatistics(STAT_GROSS_LOSS));
++   double pf = (grossLoss > 0) ? grossProfit / grossLoss
++                               : (grossProfit > 0 ? 100.0 : 0.0);
++   if(pf <= 0)
++      return 0.0;
++   //--- 最大相对回撤%（按净值，方案 1.4 验收口径），下限 1 防除零与
++   //    极小回撤刺高适应度
++   double ddRel = TesterStatistics(STAT_EQUITY_DDREL_PERCENT);
++   return pf * MathSqrt(trades) / MathMax(ddRel, 1.0);
++  }
+ //+------------------------------------------------------------------+
+diff --git a/trade/GoldTrendEA/Include/GoldTrendEA/Config.mqh b/trade/GoldTrendEA/Include/GoldTrendEA/Config.mqh
+index 3bca9a3..19c3778 100644
+--- a/trade/GoldTrendEA/Include/GoldTrendEA/Config.mqh
++++ b/trade/GoldTrendEA/Include/GoldTrendEA/Config.mqh
+@@ -2,11 +2,17 @@
+ //|                                                       Config.mqh |
+ //|  模块职责：EA 全部 input 参数集中定义 + 公共枚举/常量               |
+ //|  对应方案文档：第 4.5 节「可调参数总表」（28 项参数一一对应）+     |
+-//|               日志保留天数 InpLogKeepDays（修复四新增）              |
++//|               日志保留天数 InpLogKeepDays（修复四新增）+            |
++//|               出场增强开关与差异化冷却（第二批 G1/G2/G5 新增）+      |
++//|               版本宏/心跳/保证金阈值等（第三批 F1/F2/F5 新增）       |
+ //+------------------------------------------------------------------+
+ #ifndef __GTEA_CONFIG_MQH__
+ #define __GTEA_CONFIG_MQH__
+ 
++//--- F1：EA 版本号统一定义（日志头等处引用；#property version 不支持
++//    宏展开，主 EA 中的 #property 需随本宏同步手工更新）
++#define GTEA_VERSION  "0.20"
++
+ //--- 信号方向枚举（信号引擎输出）
+ enum ENUM_SIGNAL_DIR
+   {
+@@ -44,17 +50,23 @@ input int               InpATR_Period       = 14;         // ATR 周期（不优
+ input double            InpSL_ATR_Mult      = 2.0;        // 止损 ATR 倍数（优化 1.5~3.0 步长0.25）
+ input int               InpSwingBars        = 10;         // 结构点回溯根数（优化 5~20 步长5）
+ input double            InpRR               = 1.8;        // 固定盈亏比（优化 1.2~2.5 步长0.2）
++input bool              InpUseBreakEven     = true;       // 启用保本推损（G1，方案 4.4 默认启用）
+ input double            InpBE_Trigger       = 1.0;        // 保本触发/倍止损距离（优化 0.6~1.5）
+ input double            InpBE_Offset        = 0.3;        // 保本偏移/美元（优化 0~1.0）
++input bool              InpUseTrailing      = true;       // 启用ATR+结构点跟踪止损（G2/G3，方案 4.4 默认启用）
+ input double            InpTrail_ATR_Mult   = 2.5;        // 跟踪止损 ATR 倍数（优化 1.5~3.5 步长0.5）
+ input bool              InpTrailReplacesTP  = false;      // 跟踪启动后取消固定TP（风格对比开关）
+ 
+ //=== 一单一结机制（方案 4.3）========================================
+-input int               InpCooldownBars     = 3;          // 平仓后冷却 K 线数/H1（优化 0~10）
++//    G5：原单一 InpCooldownBars 拆分为亏损/盈利差异化冷却（方案 4.3
++//    「亏损平仓与盈利平仓可配置不同冷却长度」，默认相同）
++input int               InpCooldownBarsLoss   = 3;        // 亏损平仓冷却 K 线数/H1（G5，优化 0~10）
++input int               InpCooldownBarsProfit = 3;        // 盈利/保本平仓冷却 K 线数/H1（G5，可为 0）
+ 
+ //=== 资金管理与风控（方案 5 章，红线项不参与优化）====================
+ input double            InpRiskPercent      = 1.0;        // 单笔风险 %（实盘固定 ≤1）
+ input double            InpMaxLots          = 1.0;        // 最大手数上限（按账户规模定）
++input double            InpMaxMarginUsePct  = 50.0;       // 开仓保证金占用上限/%可用保证金（F2，原硬编码50%）
+ input double            InpDailyLossPct     = 3.0;        // 日亏损熔断 %（风控红线，不优化）
+ input double            InpWeeklyLossPct    = 6.0;        // 周亏损熔断 %（风控红线，不优化）
+ input int               InpMaxConsecLoss    = 4;          // 最大连亏次数（优化 3~6）
+@@ -68,6 +80,17 @@ input int               InpSlippagePoints   = 30;         // 最大滑点/点（
+ 
+ //=== 日志与运维（修复四：日志容量与保留策略）=======================
+ input int               InpLogKeepDays      = 30;         // 日志保留天数（超期旧日志自动清理）
++input bool              InpVerboseSignalLog = false;      // 信号评估详细日志：逐层未通过原因+指标数值（D2/F4）
++
++//=== 执行常量（修复C2/A2/E2 新增，非优化项故用宏而非 input）=========
++#define GTEA_CLOSE_MAX_ATTEMPTS      3              // 平仓失败单次调用内最大立即重试次数（修复C2）
++#define GTEA_OPEN_MAX_ATTEMPTS       3              // 开仓可重试错误累计最大尝试次数（F2，原硬编码3）
++#define GTEA_RETRY_MIN_INTERVAL_SEC  1              // 开仓重试最小间隔/秒（F2，原硬编码1秒，防轰炸服务器）
++#define GTEA_OPEN_RETRY_TIMEOUT_SEC  30             // 开仓重试超时窗口/秒，超时放弃回 IDLE（修复A2）
++#define GTEA_RECONCILE_LOOKBACK_SEC  (7 * 24 * 3600) // 离线补账缺省回查窗口/秒（修复E2，覆盖周末跳空）
++#define GTEA_SYNC_LOOKBACK_SEC       (24 * 3600)    // 状态对账兜底盈亏回查窗口/秒（A3，持仓消失刚发生，24h 足够）
++#define GTEA_HEARTBEAT_INTERVAL_SEC  (5 * 60)       // 心跳全局变量刷新间隔/秒（F5，供外部看门狗监控）
++#define GTEA_GV_NAME_MAX             63             // MT5 全局变量名长度上限（E5，超长将被终端截断）
+ 
+ //--- 全局变量（状态持久化）命名（方案 6.6）：
+ //    修复一：前缀不再使用仅含 magic 的宏，改由各模块 Init(magic, symbol)
+diff --git a/trade/GoldTrendEA/Include/GoldTrendEA/Indicators.mqh b/trade/GoldTrendEA/Include/GoldTrendEA/Indicators.mqh
+index 4efacd6..527224f 100644
+--- a/trade/GoldTrendEA/Include/GoldTrendEA/Indicators.mqh
++++ b/trade/GoldTrendEA/Include/GoldTrendEA/Indicators.mqh
+@@ -81,16 +81,17 @@ public:
+      }
+ 
+    //--- 释放全部句柄（OnDeinit 中调用，方案 6.2）
++   //    C1：释放后将句柄成员重置为 INVALID_HANDLE，防止重复释放与释放后误用
+    void              Release()
+      {
+-      if(m_hEmaFastTrend != INVALID_HANDLE) IndicatorRelease(m_hEmaFastTrend);
+-      if(m_hEmaMidTrend  != INVALID_HANDLE) IndicatorRelease(m_hEmaMidTrend);
+-      if(m_hEmaSlowTrend != INVALID_HANDLE) IndicatorRelease(m_hEmaSlowTrend);
+-      if(m_hAdxTrend     != INVALID_HANDLE) IndicatorRelease(m_hAdxTrend);
+-      if(m_hEmaFastSig   != INVALID_HANDLE) IndicatorRelease(m_hEmaFastSig);
+-      if(m_hEmaMidSig    != INVALID_HANDLE) IndicatorRelease(m_hEmaMidSig);
+-      if(m_hMacdSig      != INVALID_HANDLE) IndicatorRelease(m_hMacdSig);
+-      if(m_hAtrSig       != INVALID_HANDLE) IndicatorRelease(m_hAtrSig);
++      if(m_hEmaFastTrend != INVALID_HANDLE) { IndicatorRelease(m_hEmaFastTrend); m_hEmaFastTrend = INVALID_HANDLE; }
++      if(m_hEmaMidTrend  != INVALID_HANDLE) { IndicatorRelease(m_hEmaMidTrend);  m_hEmaMidTrend  = INVALID_HANDLE; }
++      if(m_hEmaSlowTrend != INVALID_HANDLE) { IndicatorRelease(m_hEmaSlowTrend); m_hEmaSlowTrend = INVALID_HANDLE; }
++      if(m_hAdxTrend     != INVALID_HANDLE) { IndicatorRelease(m_hAdxTrend);     m_hAdxTrend     = INVALID_HANDLE; }
++      if(m_hEmaFastSig   != INVALID_HANDLE) { IndicatorRelease(m_hEmaFastSig);   m_hEmaFastSig   = INVALID_HANDLE; }
++      if(m_hEmaMidSig    != INVALID_HANDLE) { IndicatorRelease(m_hEmaMidSig);    m_hEmaMidSig    = INVALID_HANDLE; }
++      if(m_hMacdSig      != INVALID_HANDLE) { IndicatorRelease(m_hMacdSig);      m_hMacdSig      = INVALID_HANDLE; }
++      if(m_hAtrSig       != INVALID_HANDLE) { IndicatorRelease(m_hAtrSig);       m_hAtrSig       = INVALID_HANDLE; }
+      }
+ 
+    //--- CopyBuffer 通用封装：读单个值（shift≥1，已收盘K线）
+diff --git a/trade/GoldTrendEA/Include/GoldTrendEA/Logger.mqh b/trade/GoldTrendEA/Include/GoldTrendEA/Logger.mqh
+index 0deb303..0d75d72 100644
+--- a/trade/GoldTrendEA/Include/GoldTrendEA/Logger.mqh
++++ b/trade/GoldTrendEA/Include/GoldTrendEA/Logger.mqh
+@@ -12,6 +12,9 @@
+ //--- 单日日志容量告警阈值 50MB（修复四）
+ #define GTEA_LOG_MAX_BYTES  (50 * 1024 * 1024)
+ 
++//--- C6：WARN 节流表 key 数量上限（防御性，key 种类理论上有限）
++#define GTEA_THROTTLE_MAX_KEYS  100
++
+ //--- 日志级别
+ enum ENUM_LOG_LEVEL
+   {
+@@ -161,6 +164,20 @@ public:
+            }
+         }
+       // 新 key：登记并记录
++      // C6：节流表容量上限防御 —— 若 key 异常膨胀（如误将动态内容拼入
++      //     key）则不再扩容，改为复用最旧槽位（LRU 淘汰），避免数组无限
++      //     增长；代价仅是被淘汰 key 下次出现时多记一条 WARN，可接受
++      if(n >= GTEA_THROTTLE_MAX_KEYS)
++        {
++         int oldest = 0;
++         for(int i = 1; i < n; i++)
++            if(m_throttleTimes[i] < m_throttleTimes[oldest])
++               oldest = i;
++         m_throttleKeys[oldest]  = key;
++         m_throttleTimes[oldest] = now;
++         Warn(msg);
++         return;
++        }
+       ArrayResize(m_throttleKeys, n + 1);
+       ArrayResize(m_throttleTimes, n + 1);
+       m_throttleKeys[n]  = key;
+diff --git a/trade/GoldTrendEA/Include/GoldTrendEA/MarketData.mqh b/trade/GoldTrendEA/Include/GoldTrendEA/MarketData.mqh
+index bc75f3c..622f575 100644
+--- a/trade/GoldTrendEA/Include/GoldTrendEA/MarketData.mqh
++++ b/trade/GoldTrendEA/Include/GoldTrendEA/MarketData.mqh
+@@ -74,6 +74,9 @@ public:
+    double            High(const ENUM_TIMEFRAMES tf, const int shift)  { return iHigh(m_symbol, tf, shift);  }
+    double            Low(const ENUM_TIMEFRAMES tf, const int shift)   { return iLow(m_symbol, tf, shift);   }
+ 
++   //--- K 线开盘时间（shift=0 为当前未收盘K线；G4 信号评估缓存键用）
++   datetime          BarTime(const ENUM_TIMEFRAMES tf, const int shift = 0) { return iTime(m_symbol, tf, shift); }
++
+    //--- 当前点差（点）
+    long              SpreadPoints()
+      {
+diff --git a/trade/GoldTrendEA/Include/GoldTrendEA/PositionManager.mqh b/trade/GoldTrendEA/Include/GoldTrendEA/PositionManager.mqh
+index dec8472..31edcd5 100644
+--- a/trade/GoldTrendEA/Include/GoldTrendEA/PositionManager.mqh
++++ b/trade/GoldTrendEA/Include/GoldTrendEA/PositionManager.mqh
+@@ -12,6 +12,7 @@
+ #include <Trade/PositionInfo.mqh>
+ #include <GoldTrendEA/Config.mqh>
+ #include <GoldTrendEA/Logger.mqh>
++#include <GoldTrendEA/RiskManager.mqh>   // A3：兜底路径回查盈亏后补调风控统计
+ 
+ //--- 一单一结状态机状态（方案 4.3 状态图）
+ enum ENUM_EA_STATE
+@@ -33,16 +34,35 @@ private:
+    long              m_magic;
+    string            m_symbol;
+    CLogger          *m_logger;
++   CRiskManager     *m_risk;              // A3：风控模块（可选注入，兜底补账用）
+    CPositionInfo     m_pos;               // 标准库持仓查询封装
+ 
+    ENUM_EA_STATE     m_state;             // 当前状态（内存镜像，真实持仓为准）
+    int               m_cooldownLeft;      // 冷却剩余K线数
+    datetime          m_lastCloseTime;     // 最近平仓时间（诊断用）
+    string            m_gvPrefix;          // 修复一：实例级持久化前缀 magic+symbol
++   bool              m_gvNameWarned;      // E5：全局变量名超长只告警一次（防刷屏）
++   datetime          m_lastHeartbeat;     // F5：上次心跳写入时刻（频率控制）
++   // D1：持仓计数 Tick 级缓存 —— 同一 Tick 内 CountMyPositions/HasPosition
++   //     多次调用复用结果；每 Tick 开始及开平仓动作后由外部失效
++   int               m_cachedCount;       // 缓存的本 magic 持仓数
++   bool              m_cacheValid;        // 缓存有效标记
+ 
+    //--- 全局变量名（修复一：改用 magic+symbol 实例级前缀，
+    //    避免多图表同 magic 挂载时冷却状态跨品种污染）
+-   string            GVName(const string suffix) { return m_gvPrefix + suffix; }
++   //    E5：MT5 全局变量名上限 63 字符，超长会被终端截断导致命名冲突，
++   //    记 ERROR 暴露问题（仍返回原名交由终端截断，日志用于提醒缩短组合）
++   string            GVName(const string suffix)
++     {
++      string name = m_gvPrefix + suffix;
++      if(StringLen(name) > GTEA_GV_NAME_MAX && !m_gvNameWarned)
++        {
++         m_gvNameWarned = true;
++         m_logger.Error(StringFormat("全局变量名超长(%d>%d): %s, 将被终端截断, 请缩短 magic/品种组合",
++                                     StringLen(name), GTEA_GV_NAME_MAX, name));
++        }
++      return name;
++     }
+ 
+    //--- 状态名称（日志用）
+    string            StateName(const ENUM_EA_STATE s)
+@@ -59,10 +79,55 @@ private:
+       return "UNKNOWN";
+      }
+ 
++   //--- A3：兜底路径盈亏回查 —— 持仓消失但未经 OnTradeTransaction 入账时，
++   //    回查近期历史平仓成交（过滤/防重复逻辑与主 EA 的 ReconcileOfflineDeals
++   //    一致：magic+品种+DEAL_ENTRY_OUT，且 ticket 大于最后已入账成交），
++   //    逐笔补调 RiskManager::OnTradeResult（同时登记 ticket 防重复）。
++   //    返回 true = 至少找到一笔，profitSum 输出合计盈亏
++   bool              ReconcileMissingClose(double &profitSum)
++     {
++      profitSum = 0.0;
++      if(m_risk == NULL)
++         return false;                     // 未注入风控模块，回退保守路径
++      if(!HistorySelect(TimeCurrent() - GTEA_SYNC_LOOKBACK_SEC, TimeCurrent() + 60))
++        {
++         m_logger.Warn("状态对账: HistorySelect 失败, 无法回查平仓盈亏");
++         return false;
++        }
++      ulong lastTicket = m_risk.LastDealTicket();
++      int   found      = 0;
++      int   total      = HistoryDealsTotal();
++      for(int i = 0; i < total; i++)
++        {
++         ulong deal = HistoryDealGetTicket(i);
++         if(deal == 0 || deal <= lastTicket)
++            continue;                      // 已入账过的成交跳过（防重复）
++         if(HistoryDealGetInteger(deal, DEAL_MAGIC) != m_magic)
++            continue;
++         if(HistoryDealGetString(deal, DEAL_SYMBOL) != m_symbol)
++            continue;
++         long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
++         if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
++            continue;
++         //--- 单笔盈亏口径与 OnTradeTransaction 一致（方案 6.6）
++         double profit = HistoryDealGetDouble(deal, DEAL_PROFIT)
++                       + HistoryDealGetDouble(deal, DEAL_SWAP)
++                       + HistoryDealGetDouble(deal, DEAL_COMMISSION);
++         m_logger.Warn(StringFormat("状态对账: 补记平仓成交 deal=%I64u 盈亏=%.2f", deal, profit));
++         m_risk.OnTradeResult(profit, deal);   // 补风控统计并登记 ticket 防重复
++         profitSum += profit;
++         found++;
++        }
++      return (found > 0);
++     }
++
+ public:
+                      CPositionManager() : m_magic(0), m_symbol(""), m_logger(NULL),
++                                          m_risk(NULL),
+                                           m_state(STATE_IDLE), m_cooldownLeft(0),
+-                                          m_lastCloseTime(0), m_gvPrefix("") {}
++                                          m_lastCloseTime(0), m_gvPrefix(""),
++                                          m_gvNameWarned(false), m_lastHeartbeat(0),
++                                          m_cachedCount(0), m_cacheValid(false) {}
+                     ~CPositionManager() {}
+ 
+    //--- 初始化：绑定 magic/symbol/日志
+@@ -76,6 +141,10 @@ public:
+       return (m_magic != 0 && m_symbol != "" && m_logger != NULL);
+      }
+ 
++   //--- A3：注入风控模块（OnInit 中 g_risk.Init 之后调用，兜底补账用；
++   //    未注入时 SyncWithReality 兜底路径保持原保守行为）
++   void              SetRiskManager(CRiskManager *risk) { m_risk = risk; }
++
+    //--- 当前状态（只读）
+    ENUM_EA_STATE     State() const { return m_state; }
+ 
+@@ -90,8 +159,11 @@ public:
+ 
+    //--- 统计本 EA 持仓数量：magic + symbol 双重过滤（方案 6.4 真实代码）
+    //    一单一结不变量：任何开仓动作前必须返回 0
++   //    D1：同一 Tick 内重复调用复用缓存（OnTick 顶部 InvalidateCache 失效）
+    int               CountMyPositions()
+      {
++      if(m_cacheValid)
++         return m_cachedCount;
+       int cnt = 0;
+       for(int i = PositionsTotal() - 1; i >= 0; i--)
+         {
+@@ -100,9 +172,15 @@ public:
+          if(m_pos.Magic() == m_magic && m_pos.Symbol() == m_symbol)
+             cnt++;
+         }
++      m_cachedCount = cnt;
++      m_cacheValid  = true;
+       return cnt;
+      }
+ 
++   //--- D1：失效持仓计数缓存 —— 每次 OnTick 开始、任何开/平仓动作后、
++   //    本 EA 成交回报到达时必须调用，避免脏读
++   void              InvalidateCache() { m_cacheValid = false; }
++
+    //--- 是否持有本 EA 仓位
+    bool              HasPosition() { return (CountMyPositions() > 0); }
+ 
+@@ -135,9 +213,19 @@ public:
+          // 持仓已消失（SL/TP成交或手动平仓）→ 进入冷却
+          // 注：正常路径由 OnTradeTransaction 驱动，此处为兜底；
+          //     修复三：OPENING 态无持仓属正常（Tick 驱动重试等待中），
+-         //     不在此处修正，由主 EA 的 OPENING 分支处理
++         //     不在此处修正，由主 EA 的 OPENING 分支处理；
++         //     A3：先回查历史成交获取实际盈亏（补风控统计 + 按盈亏选
++         //     冷却档），回查不到时才保守取更长的亏损冷却（原 G5 兜底）
+          m_logger.Warn("状态对账: 持仓已消失但状态=" + StateName(m_state) + ", 进入冷却期");
+-         StartCooldown();
++         double profitSum = 0.0;
++         if(ReconcileMissingClose(profitSum))
++           {
++            // 回查成功：按平仓事件正常路径结算（Notify + 按实际盈亏选冷却档）；
++            // 后续同笔成交的 OnTradeTransaction 回报由 LastDealTicket 去重跳过
++            OnPositionClosed(profitSum);
++           }
++         else
++            StartCooldown(InpCooldownBarsLoss);
+         }
+      }
+ 
+@@ -152,18 +240,21 @@ public:
+      }
+ 
+    //--- 平仓事件回调（由 OnTradeTransaction 的 DEAL_ENTRY_OUT 驱动，方案 4.3）
++   //    G5：按盈亏差异化冷却 —— 亏损用 InpCooldownBarsLoss（更长，避免
++   //    止损后立刻被同一信号再次触发连续挨打），盈利/保本用
++   //    InpCooldownBarsProfit（更短，可为 0）
+    void              OnPositionClosed(const double profit)
+      {
+       m_lastCloseTime = TimeCurrent();
+       m_logger.Notify(StringFormat("平仓结算: 盈亏=%.2f", profit));
+-      StartCooldown();
++      StartCooldown(profit < 0 ? InpCooldownBarsLoss : InpCooldownBarsProfit);
+      }
+ 
+-   //--- 启动冷却期并持久化
+-   void              StartCooldown()
++   //--- 启动冷却期并持久化（G5：冷却长度由调用方按盈亏选择）
++   void              StartCooldown(const int bars)
+      {
+-      m_cooldownLeft = InpCooldownBars;
+-      // TODO(M3, 方案 4.3)：亏损/盈利平仓可配置不同冷却长度，当前统一取 InpCooldownBars
++      ClearTradeVars();                    // G1：单笔持仓级变量随平仓清理
++      m_cooldownLeft = bars;
+       if(m_cooldownLeft > 0)
+          SetState(STATE_COOLING_DOWN);
+       else
+@@ -186,10 +277,72 @@ public:
+      }
+ 
+    //--- 状态持久化：写全局变量（EA 重启/断线不丢失，方案 6.6）
++   //    修复E2：额外记录保存时刻，供离线补账确定历史成交回查窗口
+    void              SaveState()
+      {
+       GlobalVariableSet(GVName("COOLDOWN_LEFT"), (double)m_cooldownLeft);
+       GlobalVariableSet(GVName("STATE"), (double)m_state);
++      GlobalVariableSet(GVName("STATE_TIME"), (double)TimeCurrent());
++     }
++
++   //--- 修复E2：读取上次持久化的状态（离线补账判断用），无记录返回 IDLE
++   ENUM_EA_STATE     SavedState()
++     {
++      if(GlobalVariableCheck(GVName("STATE")))
++         return (ENUM_EA_STATE)(int)GlobalVariableGet(GVName("STATE"));
++      return STATE_IDLE;
++     }
++
++   //--- 修复E2：上次状态持久化时刻，无记录返回 0
++   datetime          StateSavedTime()
++     {
++      if(GlobalVariableCheck(GVName("STATE_TIME")))
++         return (datetime)GlobalVariableGet(GVName("STATE_TIME"));
++      return 0;
++     }
++
++   //=== G1：单笔持仓级持久化（初始止损距离/保本完成标记，重启可恢复）===
++
++   //--- 开仓成功后持久化初始止损距离（保本触发基准，保本后 pos.StopLoss
++   //    已变化无法反推），并清除上一笔的保本完成标记
++   void              SaveInitialSLDist(const double dist)
++     {
++      GlobalVariableSet(GVName("INIT_SLDIST"), dist);
++      GlobalVariableDel(GVName("BE_DONE"));
++     }
++
++   //--- 读取持久化的初始止损距离，无记录返回 0
++   double            InitialSLDist()
++     {
++      if(GlobalVariableCheck(GVName("INIT_SLDIST")))
++         return GlobalVariableGet(GVName("INIT_SLDIST"));
++      return 0.0;
++     }
++
++   //--- 保本已完成标记（持久化，保本只推一次、EA 重启后不重复推）
++   void              MarkBreakEvenDone() { GlobalVariableSet(GVName("BE_DONE"), 1.0); }
++   bool              IsBreakEvenDone()
++     {
++      return (GlobalVariableCheck(GVName("BE_DONE")) &&
++              GlobalVariableGet(GVName("BE_DONE")) > 0);
++     }
++
++   //--- 平仓后清除单笔持仓级变量（StartCooldown 统一调用，覆盖所有平仓路径）
++   void              ClearTradeVars()
++     {
++      GlobalVariableDel(GVName("INIT_SLDIST"));
++      GlobalVariableDel(GVName("BE_DONE"));
++     }
++
++   //--- F5：心跳机制 —— 每 GTEA_HEARTBEAT_INTERVAL_SEC 秒写一次心跳全局
++   //    变量（当前服务器时间），供外部看门狗监控 EA 存活；OnTick 顶部调用
++   void              UpdateHeartbeat()
++     {
++      datetime now = TimeCurrent();
++      if(now - m_lastHeartbeat < GTEA_HEARTBEAT_INTERVAL_SEC)
++         return;
++      m_lastHeartbeat = now;
++      GlobalVariableSet(GVName("HEARTBEAT"), (double)now);
+      }
+ 
+    //--- 状态恢复：OnInit 中调用（方案 4.3 / 8.2 状态恢复流程）
+@@ -201,8 +354,18 @@ public:
+          // 检测到本 magic 已有持仓 → 直接进入持仓管理
+          m_state = STATE_POSITION_OPEN;
+          m_logger.Info("状态恢复: 检测到存量持仓, 进入 POSITION_OPEN");
+-         // TODO(M3, 方案 8.2)：重连后首个Tick做全量对账（SL/TP是否与预期一致），
+-         //      不一致时修正并告警
++         // G10（方案 8.2）：SL/TP 存在性与方向对账由主 EA 的
++         //      ReconcileRestoredStops 在 RestoreState 之后执行
++         return;
++        }
++      // E1：持久化状态为 OPENING（下单中断重启）且当前无持仓 → 待重试
++      //     参数已丢失，直接归为 IDLE 重走信号评估（不再依赖运行时
++      //     RetryOpenPosition 的异常兜底）
++      if(SavedState() == STATE_OPENING)
++        {
++         m_state = STATE_IDLE;
++         m_logger.Info("状态恢复: 上次停机时为 OPENING(开仓中断)且当前无持仓, 直接归为 IDLE");
++         SaveState();
+          return;
+         }
+       if(GlobalVariableCheck(GVName("COOLDOWN_LEFT")))
+diff --git a/trade/GoldTrendEA/Include/GoldTrendEA/RiskManager.mqh b/trade/GoldTrendEA/Include/GoldTrendEA/RiskManager.mqh
+index db4bcd5..76e27aa 100644
+--- a/trade/GoldTrendEA/Include/GoldTrendEA/RiskManager.mqh
++++ b/trade/GoldTrendEA/Include/GoldTrendEA/RiskManager.mqh
+@@ -30,11 +30,25 @@ private:
+    datetime          m_pauseUntil;         // 连亏暂停截止时间（0=未暂停）
+    int               m_lastResetDay;       // 上次日复位的"天"标识
+    int               m_lastResetWeek;      // 上次周复位的"周"标识
++   ulong             m_lastDealTicket;     // 修复E2：最后已入账平仓成交 ticket（离线补账防重复）
+    string            m_gvPrefix;           // 修复一：实例级持久化前缀 magic+symbol
++   bool              m_gvNameWarned;       // E5：全局变量名超长只告警一次（防刷屏）
+ 
+    //--- 修复一：改用 magic+symbol 实例级前缀，避免多图表同 magic 挂载时
+    //    风控统计（日/周亏损、连亏计数）跨品种污染
+-   string            GVName(const string suffix) { return m_gvPrefix + "RISK_" + suffix; }
++   //    E5：MT5 全局变量名上限 63 字符，超长会被终端截断导致命名冲突，
++   //    记 ERROR 暴露问题（仍返回原名交由终端截断，日志用于提醒缩短组合）
++   string            GVName(const string suffix)
++     {
++      string name = m_gvPrefix + "RISK_" + suffix;
++      if(StringLen(name) > GTEA_GV_NAME_MAX && !m_gvNameWarned)
++        {
++         m_gvNameWarned = true;
++         m_logger.Error(StringFormat("全局变量名超长(%d>%d): %s, 将被终端截断, 请缩短 magic/品种组合",
++                                     StringLen(name), GTEA_GV_NAME_MAX, name));
++        }
++      return name;
++     }
+ 
+    //--- 当前服务器时间结构
+    void              NowStruct(MqlDateTime &dt) { TimeToStruct(TimeCurrent(), dt); }
+@@ -45,7 +59,8 @@ public:
+                                       m_dailyLoss(0), m_weeklyLoss(0),
+                                       m_consecLosses(0), m_pauseUntil(0),
+                                       m_lastResetDay(-1), m_lastResetWeek(-1),
+-                                      m_gvPrefix("") {}
++                                      m_lastDealTicket(0), m_gvPrefix(""),
++                                      m_gvNameWarned(false) {}
+                     ~CRiskManager() {}
+ 
+    //--- 初始化：绑定 magic/品种/日志并恢复持久化的熔断状态
+@@ -57,6 +72,21 @@ public:
+       m_logger = logger;
+       m_gvPrefix = "GTEA_" + (string)m_magic + "_" + m_symbol + "_";
+       LoadState();
++      // B2：风控基数兜底快照 —— 首次运行/全局变量被清时无持久化基数，
++      //     若等到 CheckPeriodReset 跨日/跨周才快照，当日熔断阈值只能回退
++      //     临时取当前净值（IsHalted 内的兜底分支），此处主动补快照固化
++      if(m_dailyBaseEquity <= 0 || m_weeklyBaseEquity <= 0)
++        {
++         double equity = AccountInfoDouble(ACCOUNT_EQUITY);
++         if(m_dailyBaseEquity <= 0)
++            m_dailyBaseEquity = equity;
++         if(m_weeklyBaseEquity <= 0)
++            m_weeklyBaseEquity = equity;
++         if(m_logger != NULL)
++            m_logger.Info(StringFormat("风控基数补快照: 日基数=%.2f 周基数=%.2f",
++                                       m_dailyBaseEquity, m_weeklyBaseEquity));
++         SaveState();
++        }
+       return (m_magic != 0 && m_symbol != "" && m_logger != NULL);
+      }
+ 
+@@ -103,10 +133,18 @@ public:
+                                     lots, lotMin));
+          return 0.0;
+         }
+-      return NormalizeDouble(lots, 2);
++      // 修复B1：按 VOLUME_STEP 动态计算手数小数位（lotStep=0.01→2位、
++      //         0.1→1位、1→0位），避免固定 2 位与品种步长不符产生非法手数
++      int lotDigits = 2;
++      if(lotStep > 0)
++         lotDigits = (int)MathRound(-MathLog10(lotStep));
++      if(lotDigits < 0)
++         lotDigits = 0;
++      return NormalizeDouble(lots, lotDigits);
+      }
+ 
+-   //--- 保证金校验：开仓占用 <= 可用保证金的 50%（方案 5.1）
++   //--- 保证金校验：开仓占用 <= 可用保证金的 InpMaxMarginUsePct%（方案 5.1，
++   //    F2：原硬编码 50% 提取为 input）
+    bool              MarginOk(const ENUM_ORDER_TYPE type, const double lots, const double price)
+      {
+       double marginNeed = 0.0;
+@@ -116,10 +154,10 @@ public:
+          return false;
+         }
+       double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+-      if(marginNeed > freeMargin * 0.5)
++      if(marginNeed > freeMargin * InpMaxMarginUsePct / 100.0)
+         {
+-         m_logger.Warn(StringFormat("保证金校验: 需 %.2f > 可用 %.2f 的50%%, 放弃开仓",
+-                                    marginNeed, freeMargin));
++         m_logger.Warn(StringFormat("保证金校验: 需 %.2f > 可用 %.2f 的%.0f%%, 放弃开仓",
++                                    marginNeed, freeMargin, InpMaxMarginUsePct));
+          return false;
+         }
+       return true;
+@@ -193,10 +231,14 @@ public:
+ 
+    //=== 盈亏统计与周期复位（方案 5.2 / 6.6）===========================
+ 
+-   //--- 成交回报回调：由 OnTradeTransaction 的 DEAL_ENTRY_OUT 驱动
+-   //    profit 应为 DEAL_PROFIT + DEAL_SWAP + DEAL_COMMISSION 之和
+-   void              OnTradeResult(const double profit)
++   //--- 成交回报回调：由 OnTradeTransaction 的 DEAL_ENTRY_OUT 驱动，
++   //    离线补账（修复E2）时也由主 EA 回查历史后补调
++   //    profit 应为 DEAL_PROFIT + DEAL_SWAP + DEAL_COMMISSION 之和；
++   //    dealTicket 非 0 时登记为最后已入账成交，供离线补账防重复
++   void              OnTradeResult(const double profit, const ulong dealTicket = 0)
+      {
++      if(dealTicket > 0 && dealTicket > m_lastDealTicket)
++         m_lastDealTicket = dealTicket;
+       if(profit < 0)
+         {
+          m_dailyLoss  += -profit;
+@@ -219,10 +261,23 @@ public:
+       SaveState();
+      }
+ 
++   //--- 修复E2：最后已入账平仓成交 ticket（离线补账去重用，只读）
++   ulong             LastDealTicket() const { return m_lastDealTicket; }
++
+    //--- 周期复位检查：每 Tick 轻量调用；跨日/跨周时复位统计并快照基数
+    //    （方案 5.2：基数在每日/每周首次交易前快照，熔断次日/下周一自动复位）
+    void              CheckPeriodReset()
+      {
++      // 修复B3：连亏暂停到期后清零连亏计数并复位暂停时间，同步持久化；
++      //         否则恢复交易后首笔亏损会基于旧计数立即再次触发暂停
++      if(m_pauseUntil > 0 && TimeCurrent() >= m_pauseUntil)
++        {
++         m_logger.Info(StringFormat("连亏暂停到期: 清零连亏计数(原 %d 笔), 恢复开仓评估",
++                                    m_consecLosses));
++         m_consecLosses = 0;
++         m_pauseUntil   = 0;
++         SaveState();
++        }
+       MqlDateTime dt;
+       NowStruct(dt);
+       // 跨日复位（服务器时间 0 点后首个 Tick）
+@@ -258,6 +313,7 @@ public:
+       GlobalVariableSet(GVName("PAUSE_UNTIL"),  (double)m_pauseUntil);
+       GlobalVariableSet(GVName("RESET_DAY"),    (double)m_lastResetDay);
+       GlobalVariableSet(GVName("RESET_WEEK"),   (double)m_lastResetWeek);
++      GlobalVariableSet(GVName("LAST_DEAL"),    (double)m_lastDealTicket);   // 修复E2
+      }
+ 
+    void              LoadState()
+@@ -270,6 +326,7 @@ public:
+       if(GlobalVariableCheck(GVName("PAUSE_UNTIL")))  m_pauseUntil      = (datetime)GlobalVariableGet(GVName("PAUSE_UNTIL"));
+       if(GlobalVariableCheck(GVName("RESET_DAY")))    m_lastResetDay    = (int)GlobalVariableGet(GVName("RESET_DAY"));
+       if(GlobalVariableCheck(GVName("RESET_WEEK")))   m_lastResetWeek   = (int)GlobalVariableGet(GVName("RESET_WEEK"));
++      if(GlobalVariableCheck(GVName("LAST_DEAL")))    m_lastDealTicket  = (ulong)GlobalVariableGet(GVName("LAST_DEAL"));   // 修复E2
+      }
+   };
+ 
+diff --git a/trade/GoldTrendEA/Include/GoldTrendEA/SignalEngine.mqh b/trade/GoldTrendEA/Include/GoldTrendEA/SignalEngine.mqh
+index da3f163..ea47b6e 100644
+--- a/trade/GoldTrendEA/Include/GoldTrendEA/SignalEngine.mqh
++++ b/trade/GoldTrendEA/Include/GoldTrendEA/SignalEngine.mqh
+@@ -24,6 +24,11 @@ private:
+    CIndicators      *m_ind;                // 指标计算层（依赖注入）
+    CLogger          *m_logger;
+ 
++   //--- G4：同一根信号周期K线内的评估结果缓存（开仓评估与持仓期
++   //    反向信号检测共用，避免重复 CopyBuffer 与重复日志）
++   datetime          m_lastEvalBarTime;    // 缓存所属的信号周期K线开盘时间
++   ENUM_SIGNAL_DIR   m_lastEvalDir;        // 缓存的评估结果
++
+    //--- 第①②层：趋势方向判定（H4 EMA 排列 + ADX 强度，方案 4.1）
+    //    返回 +1 多头 / -1 空头 / 0 震荡或数据不足
+    int               TrendDirection()
+@@ -125,8 +130,39 @@ private:
+       return false;
+      }
+ 
++   //--- D2/F4：各层诊断串（仅 InpVerboseSignalLog=true 时调用，附关键
++   //    指标数值便于复盘；额外 CopyBuffer 只在开启详细日志时发生）
++   string            TrendDiag()
++     {
++      double emaF = 0, emaM = 0, emaS = 0, adx = 0;
++      if(!m_ind.EmaFastTrend(emaF) || !m_ind.EmaMidTrend(emaM) ||
++         !m_ind.EmaSlowTrend(emaS) || !m_ind.AdxTrend(adx))
++         return "趋势层指标数据不足";
++      return StringFormat("EMA%d=%.2f EMA%d=%.2f EMA%d=%.2f ADX=%.1f",
++                          InpEMA_Fast, emaF, InpEMA_Mid, emaM,
++                          InpEMA_Slow, emaS, adx);
++     }
++
++   string            MacdDiag()
++     {
++      double main[], sig[];
++      if(!m_ind.MacdMain(main, 2) || !m_ind.MacdSignal(sig, 2))
++         return "MACD数据不足";
++      return StringFormat("MACD主线=%.3f 信号线=%.3f", main[0], sig[0]);
++     }
++
++   string            BreakoutDiag()
++     {
++      double closeSig = m_market.Close(InpSignalTF, 1);
++      double upper = 0, lower = 0;
++      m_ind.DonchianUpper(upper, InpDonchian_Period);
++      m_ind.DonchianLower(lower, InpDonchian_Period);
++      return StringFormat("收盘=%.2f 唐奇安上轨=%.2f 下轨=%.2f", closeSig, upper, lower);
++     }
++
+ public:
+-                     CSignalEngine() : m_market(NULL), m_ind(NULL), m_logger(NULL) {}
++                     CSignalEngine() : m_market(NULL), m_ind(NULL), m_logger(NULL),
++                                       m_lastEvalBarTime(0), m_lastEvalDir(SIGNAL_NONE) {}
+                     ~CSignalEngine() {}
+ 
+    //--- 初始化：注入行情层、指标层与日志
+@@ -139,30 +175,57 @@ public:
+      }
+ 
+    //--- 信号评估主入口：仅应在信号周期新 K 线时调用（方案 3.4 主流程）
+-   //    三重过滤全部通过才输出方向信号；记录每层过滤结果便于诊断
++   //    三重过滤全部通过才输出方向信号；逐层未通过的 Info 日志默认关闭
++   //    （D2 降噪），InpVerboseSignalLog=true 时输出并附关键指标数值（F4）；
++   //    缓存机制下本函数只在实际评估那次执行，日志不会重复
+    ENUM_SIGNAL_DIR   Evaluate()
+      {
+       int dir = TrendDirection();
+       if(dir == 0)
+         {
+-         m_logger.Info("信号评估: 趋势方向层未通过(震荡/ADX不足/数据不足)");
++         if(InpVerboseSignalLog)
++            m_logger.Info("信号评估: 趋势方向层未通过(震荡/ADX不足/数据不足) [" + TrendDiag() + "]");
+          return SIGNAL_NONE;
+         }
+       if(!MomentumOk(dir))
+         {
+-         m_logger.Info(StringFormat("信号评估: 方向=%d 通过, MACD动能层未通过", dir));
++         if(InpVerboseSignalLog)
++            m_logger.Info(StringFormat("信号评估: 方向=%d 通过, MACD动能层未通过 [%s]",
++                                       dir, MacdDiag()));
+          return SIGNAL_NONE;
+         }
+       if(!BreakoutOk(dir))
+         {
+-         m_logger.Info(StringFormat("信号评估: 方向=%d+动能通过, 唐奇安突破层未通过", dir));
++         if(InpVerboseSignalLog)
++            m_logger.Info(StringFormat("信号评估: 方向=%d+动能通过, 唐奇安突破层未通过 [%s]",
++                                       dir, BreakoutDiag()));
+          return SIGNAL_NONE;
+         }
+-      m_logger.Info(StringFormat("信号评估: 三重过滤全部通过, 方向=%s",
+-                                 dir > 0 ? "BUY" : "SELL"));
++      // 三重过滤全部通过属关键事件，始终记录；详细日志时附全层指标值
++      m_logger.Info(StringFormat("信号评估: 三重过滤全部通过, 方向=%s%s",
++                                 dir > 0 ? "BUY" : "SELL",
++                                 InpVerboseSignalLog
++                                 ? " [" + TrendDiag() + " " + MacdDiag() + " " + BreakoutDiag() + "]"
++                                 : ""));
+       return (dir > 0) ? SIGNAL_BUY : SIGNAL_SELL;
+      }
+ 
++   //--- G4：带同K线缓存的评估入口 —— 同一根信号周期K线内重复调用
++   //    直接返回缓存结果，避免开仓评估与反向离场检测重复计算指标
++   ENUM_SIGNAL_DIR   EvaluateCached()
++     {
++      datetime barTime = m_market.BarTime(InpSignalTF, 0);
++      if(barTime > 0 && barTime == m_lastEvalBarTime)
++         return m_lastEvalDir;             // 本根K线已评估过，直接取缓存
++      ENUM_SIGNAL_DIR dir = Evaluate();
++      if(barTime > 0)                      // 历史未同步(barTime=0)时不缓存
++        {
++         m_lastEvalBarTime = barTime;
++         m_lastEvalDir     = dir;
++        }
++      return dir;
++     }
++
+    //--- 趋势反转检测（持仓管理期调用，方案 4.4「趋势反转强制离场」）
+    //    posDir: 当前持仓方向(+1多/-1空)；返回 true = 应强制离场
+    bool              IsTrendReversed(const int posDir)
+@@ -174,9 +237,19 @@ public:
+          if(posDir > 0 && emaF < emaM) return true;
+          if(posDir < 0 && emaF > emaM) return true;
+         }
+-      // 条件二：出现完整的反向三重信号
+-      // TODO(M2, 方案 4.4)：调用 Evaluate() 判断是否输出与持仓相反的信号；
+-      //      注意避免与开仓评估重复计算，可缓存本根K线的评估结果
++      // 条件二（G4）：出现完整的反向三重信号（方向+动能+突破全部
++      // 反向成立）—— 复用带缓存的 Evaluate，同一根K线内不重复计算
++      ENUM_SIGNAL_DIR sig = EvaluateCached();
++      if(posDir > 0 && sig == SIGNAL_SELL)
++        {
++         m_logger.Info("反转检测: 持多单期间出现完整反向三重卖出信号");
++         return true;
++        }
++      if(posDir < 0 && sig == SIGNAL_BUY)
++        {
++         m_logger.Info("反转检测: 持空单期间出现完整反向三重买入信号");
++         return true;
++        }
+       return false;
+      }
+   };
+diff --git a/trade/GoldTrendEA/Include/GoldTrendEA/TradeExecutor.mqh b/trade/GoldTrendEA/Include/GoldTrendEA/TradeExecutor.mqh
+index f912211..b7ef727 100644
+--- a/trade/GoldTrendEA/Include/GoldTrendEA/TradeExecutor.mqh
++++ b/trade/GoldTrendEA/Include/GoldTrendEA/TradeExecutor.mqh
+@@ -1,8 +1,9 @@
+ //+------------------------------------------------------------------+
+ //|                                                TradeExecutor.mqh |
+ //|  模块职责：订单执行模块 —— CTrade 封装：市价开/平仓、下单错误       |
+-//|            退避重试、滑点设置、SL/TP 规范化校验、保本推损与 ATR     |
+-//|            跟踪止损接口                                             |
++//|            退避重试、滑点设置、SL/TP 规范化校验、改单统一入口       |
++//|            ModifySL（保本推损/跟踪止损的具体策略在主 EA 的         |
++//|            ManagePosition 中实现，G1/G2/G3）                        |
+ //|  对应方案文档：第 3.2 节（CExecutor）、4.4 节（出场规则）、         |
+ //|               6.3 节（CTrade 下单与错误重试）                       |
+ //+------------------------------------------------------------------+
+@@ -38,9 +39,10 @@ private:
+      }
+ 
+    //--- SL/TP 停损距校验：距离基准价须 >= SYMBOL_TRADE_STOPS_LEVEL（方案 6.3）
+-   //    黄金上常见 Invalid stops 拒单，下单/改单前必须校验
+-   //    修复二：买单 SL/TP 以 Ask 为基准、卖单以 Bid 为基准（与服务器规则一致，
+-   //    原买单用 Bid 校验比服务器更严，会误拒刚好满足 stopsLevel 的合法止损）
++   //    黄金上常见 Invalid stops 拒单，开仓下单前必须校验
++   //    修复C4：按 MT5 服务器规则校验 —— 买单 SL 相对 Bid、TP 相对 Ask；
++   //    卖单 SL 相对 Ask、TP 相对 Bid（原实现买单 SL 错用 Ask 基准，
++   //    点差拉宽时会误拒合法止损）
+    bool              ValidateStops(const bool isBuy, const double sl, const double tp)
+      {
+       double point      = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+@@ -51,19 +53,44 @@ private:
+ 
+       if(isBuy)
+         {
+-         // 买单：SL/TP 相对 Ask 校验
+-         if(sl > 0 && ask - sl < minDist) return false;
++         // 买单：SL 相对 Bid、TP 相对 Ask 校验
++         if(sl > 0 && bid - sl < minDist) return false;
+          if(tp > 0 && tp - ask < minDist) return false;
+         }
+       else
+         {
+-         // 卖单：SL/TP 相对 Bid 校验
+-         if(sl > 0 && sl - bid < minDist) return false;
++         // 卖单：SL 相对 Ask、TP 相对 Bid 校验
++         if(sl > 0 && sl - ask < minDist) return false;
+          if(tp > 0 && bid - tp < minDist) return false;
+         }
+       return true;
+      }
+ 
++   //--- 修复E3：改单场景放宽版校验 —— 仅做基础 sanity check（有限值、
++   //    非负、方向正确），不校验最小停损距，由服务器端做最终裁决；
++   //    避免极端点差下保本推损/跟踪止损改单被本地校验误拒（开仓路径
++   //    仍用严格版 ValidateStops）
++   bool              ValidateStopsRelaxed(const bool isBuy, const double sl, const double tp)
++     {
++      if(!MathIsValidNumber(sl) || !MathIsValidNumber(tp))
++         return false;
++      if(sl < 0 || tp < 0)
++         return false;
++      double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
++      double ask = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
++      if(isBuy)
++        {
++         if(sl > 0 && sl >= bid) return false;   // 多单 SL 须低于 Bid
++         if(tp > 0 && tp <= ask) return false;   // 多单 TP 须高于 Ask
++        }
++      else
++        {
++         if(sl > 0 && sl <= ask) return false;   // 空单 SL 须高于 Ask
++         if(tp > 0 && tp >= bid) return false;   // 空单 TP 须低于 Bid
++        }
++      return true;
++     }
++
+    //--- 错误码是否可重试（requote/价格变化类，方案 6.3）
+    bool              IsRetryableError(const uint retcode)
+      {
+@@ -96,7 +123,8 @@ public:
+    //    dir: SIGNAL_BUY/SIGNAL_SELL；sl/tp 传 0 表示不设置
+    //    返回 true = 开仓成功；返回 false 时由 IsRetryPending() 区分：
+    //      true  = 可重试失败，等待下一 Tick 再试（调用方保持 OPENING 态）
+-   //      false = 不可重试/累计 3 次重试耗尽，已放弃（调用方回退 IDLE）
++   //      false = 不可重试/累计 GTEA_OPEN_MAX_ATTEMPTS 次重试耗尽，已放弃
++   //              （调用方回退 IDLE）
+    bool              Open(const ENUM_SIGNAL_DIR dir, const double lots,
+                           double sl, double tp, const string comment)
+      {
+@@ -105,8 +133,23 @@ public:
+          ResetRetry();
+          return false;
+         }
+-      // 重试间隔保护：距上次尝试不足 1 秒则等待后续 Tick（防 Tick 密集时轰炸服务器）
+-      if(m_retryPending && TimeCurrent() - m_lastRetryTime < 1)
++      // A1：一单一结防御性二次校验 —— 主流程由 CanOpenNew 把关，此处为
++      //     发送前最后一道防线（防状态机漏洞/未来新开仓路径绕过检查）
++      for(int i = PositionsTotal() - 1; i >= 0; i--)
++        {
++         if(!m_pos.SelectByIndex(i))
++            continue;
++         if(m_pos.Magic() == m_magic && m_pos.Symbol() == m_symbol)
++           {
++            m_logger.Warn(StringFormat("开仓拒绝: 本 magic 已持有仓位 ticket=%I64u(一单一结防御性二次校验)",
++                                       m_pos.Ticket()));
++            ResetRetry();
++            return false;
++           }
++        }
++      // 重试间隔保护：距上次尝试不足 GTEA_RETRY_MIN_INTERVAL_SEC 秒则等待
++      // 后续 Tick（防 Tick 密集时轰炸服务器）
++      if(m_retryPending && TimeCurrent() - m_lastRetryTime < GTEA_RETRY_MIN_INTERVAL_SEC)
+          return false;
+ 
+       bool isBuy = (dir == SIGNAL_BUY);
+@@ -138,9 +181,9 @@ public:
+       if(IsRetryableError(rc))
+         {
+          m_retryAttempt++;
+-         if(m_retryAttempt >= 3)
++         if(m_retryAttempt >= GTEA_OPEN_MAX_ATTEMPTS)
+            {
+-            // 累计 3 次失败：放弃，由调用方回退状态机 IDLE（保持原回退语义）
++            // 累计尝试耗尽：放弃，由调用方回退状态机 IDLE（保持原回退语义）
+             m_logger.Error(StringFormat("开仓失败: 累计 %d 次重试耗尽 retcode=%u",
+                                         m_retryAttempt, rc));
+             ResetRetry();
+@@ -149,8 +192,8 @@ public:
+          m_retryPending = true;
+          // 重试日志节流，避免密集 Tick 下刷屏
+          m_logger.WarnThrottled("open_retry",
+-                                StringFormat("开仓可重试失败(第 %d/3 次): retcode=%u, 等待下一 Tick 重试",
+-                                             m_retryAttempt, rc), 60);
++                                StringFormat("开仓可重试失败(第 %d/%d 次): retcode=%u, 等待下一 Tick 重试",
++                                             m_retryAttempt, GTEA_OPEN_MAX_ATTEMPTS, rc), 60);
+          return false;
+         }
+       // 不可重试错误（资金不足/交易禁止等）：立即放弃
+@@ -166,6 +209,9 @@ public:
+    void              ResetRetry() { m_retryAttempt = 0; m_retryPending = false; }
+ 
+    //--- 市价平掉本 EA 持仓（趋势反转/周五离场/熔断强平用）
++   //    修复C2：失败后本次调用内立即重试（最多 GTEA_CLOSE_MAX_ATTEMPTS 次，
++   //    复用开仓的可重试错误判定）；仍失败时返回 false，由主 EA 在
++   //    CLOSING 态下的后续 Tick 继续尝试直到成功
+    bool              CloseMyPosition(const string reason)
+      {
+       for(int i = PositionsTotal() - 1; i >= 0; i--)
+@@ -174,13 +220,28 @@ public:
+             continue;
+          if(m_pos.Magic() != m_magic || m_pos.Symbol() != m_symbol)
+             continue;
++         ulong ticket = m_pos.Ticket();
+          // Netting/Hedging 统一走 PositionClose（方案 6.6 账户模式适配）
+-         if(m_trade.PositionClose(m_pos.Ticket()))
++         for(int attempt = 1; attempt <= GTEA_CLOSE_MAX_ATTEMPTS; attempt++)
+            {
+-            m_logger.Notify("平仓成功: " + reason + ", ticket=" + (string)m_pos.Ticket());
+-            return true;
++            if(m_trade.PositionClose(ticket))
++              {
++               m_logger.Notify("平仓成功: " + reason + ", ticket=" + (string)ticket);
++               return true;
++              }
++            uint rc = m_trade.ResultRetcode();
++            if(!IsRetryableError(rc))
++              {
++               // 不可重试错误（市场关闭/交易禁止等）：立即退出，交由后续 Tick
++               m_logger.Error(StringFormat("平仓失败(不可重试): %s retcode=%u, 等待后续 Tick 再试",
++                                           reason, rc));
++               return false;
++              }
++            m_logger.Warn(StringFormat("平仓可重试失败(第 %d/%d 次): %s retcode=%u",
++                                       attempt, GTEA_CLOSE_MAX_ATTEMPTS, reason, rc));
+            }
+-         m_logger.Error(StringFormat("平仓失败: %s retcode=%u", reason, m_trade.ResultRetcode()));
++         m_logger.Error(StringFormat("平仓失败: 本次 %d 次重试耗尽, 将由后续 Tick 继续尝试: %s",
++                                     GTEA_CLOSE_MAX_ATTEMPTS, reason));
+          return false;
+         }
+       return false;                        // 无持仓
+@@ -192,7 +253,7 @@ public:
+      {
+       double sl  = NormalizePrice(newSL);
+       double ntp = NormalizePrice(tp);
+-      // 修复五：先选中持仓确定方向，复用 ValidateStops 本地校验新 SL/TP，
++      // 修复五：先选中持仓确定方向，本地校验新 SL/TP，
+       //         避免向服务器反复发送无效改单
+       if(!m_pos.SelectByTicket(ticket))
+         {
+@@ -200,9 +261,11 @@ public:
+          return false;
+         }
+       bool isBuy = (m_pos.PositionType() == POSITION_TYPE_BUY);
+-      if(!ValidateStops(isBuy, sl, ntp))
++      // 修复E3：改单路径改用放宽版校验（仅 sanity check），避免极端点差下
++      //         严格版 ValidateStops 误拒保本/跟踪改单，最小停损距由服务器裁决
++      if(!ValidateStopsRelaxed(isBuy, sl, ntp))
+         {
+-         m_logger.Warn(StringFormat("改单放弃: SL/TP 不满足最小停损距 sl=%.2f tp=%.2f", sl, ntp));
++         m_logger.Warn(StringFormat("改单放弃: SL/TP 基础校验未通过(方向/数值非法) sl=%.2f tp=%.2f", sl, ntp));
+          return false;
+         }
+       if(!m_trade.PositionModify(ticket, sl, ntp))
+@@ -213,36 +276,6 @@ public:
+         }
+       return true;
+      }
+-
+-   //--- 保本推损（方案 4.4）：浮盈达到 止损距离×InpBE_Trigger 时
+-   //    将 SL 移至 入场价 ± InpBE_Offset
+-   //    返回 true = 本次执行了推损动作
+-   bool              ApplyBreakEven(CPositionInfo &pos)
+-     {
+-      // TODO(M3, 方案 4.4)：完整实现，骨架逻辑如下 ——
+-      // double entry   = pos.PriceOpen();
+-      // double slDist  = MathAbs(entry - pos.StopLoss());   // 初始止损距离(需在开仓时另行持久化,
+-      //                                                     //  因保本后 pos.StopLoss 已变化)
+-      // bool   isBuy   = (pos.PositionType() == POSITION_TYPE_BUY);
+-      // double profit  = isBuy ? (当前Bid - entry) : (entry - 当前Ask);
+-      // if(profit >= slDist * InpBE_Trigger 且 当前SL仍劣于保本位)
+-      //     newSL = entry ± InpBE_Offset;  ModifySL(...);
+-      return false;
+-     }
+-
+-   //--- ATR 跟踪止损（方案 4.4）：保本后启动，每根信号周期新 K 线调用
+-   //    newSL = 收盘价 ∓ atr × InpTrail_ATR_Mult，只朝有利方向移动
+-   bool              ApplyAtrTrailing(CPositionInfo &pos, const double atr)
+-     {
+-      // TODO(M3, 方案 4.4)：完整实现，骨架逻辑如下 ——
+-      // bool   isBuy = (pos.PositionType() == POSITION_TYPE_BUY);
+-      // double close = iClose(m_symbol, InpSignalTF, 1);
+-      // double newSL = isBuy ? close - atr * InpTrail_ATR_Mult
+-      //                      : close + atr * InpTrail_ATR_Mult;
+-      // 仅当 newSL 优于当前 SL（多单更高/空单更低）时才 ModifySL；
+-      // 若 InpTrailReplacesTP=true，跟踪启动后将 TP 置 0（方案 4.4 风格开关）
+-      return false;
+-     }
+   };
+ 
+ #endif // __GTEA_TRADEEXECUTOR_MQH__
+diff --git a/trade/GoldTrendEA/README.md b/trade/GoldTrendEA/README.md
+index 6a3bd36..6720e12 100644
+--- a/trade/GoldTrendEA/README.md
++++ b/trade/GoldTrendEA/README.md
+@@ -1,7 +1,7 @@
+ # GoldTrendEA — 黄金外汇「顺势一单一结」EA 框架
+ 
+ > 对应方案文档：[黄金外汇EA顺势一单一结开发方案.md](../黄金外汇EA顺势一单一结开发方案.md)
+-> 当前版本：v0.10（M1 框架搭建阶段产出：接口定义 + 骨架实现，**非完整可交易版本**）
++> 当前版本：v0.20（版本号统一由 `Config.mqh` 的 `GTEA_VERSION` 定义；框架+出场增强+健壮性优化阶段产出，**非完整可交易版本**）
+ 
+ ## 目录结构
+ 
+@@ -11,7 +11,7 @@ GoldTrendEA/
+ │   └── GoldTrendEA.mq5            # 主 EA：OnInit/OnTick/OnDeinit/OnTradeTransaction
+ ├── Include/
+ │   └── GoldTrendEA/
+-│       ├── Config.mqh             # 29 项 input 参数 + 公共枚举（方案 4.5 节参数表 + InpLogKeepDays 日志保留天数）
++│       ├── Config.mqh             # 全部 input 参数 + 公共枚举/常量（方案 4.5 节参数表 + 版本宏 GTEA_VERSION/心跳/保证金阈值等）
+ │       ├── Logger.mqh             # 日志与通知：分级日志/WARN节流/手机推送（方案 8.3）
+ │       ├── MarketData.mqh         # 行情数据层：新K线判定/OHLC/点差/环境校验（方案 6.1/6.5）
+ │       ├── Indicators.mqh         # 指标计算层：句柄管理/CopyBuffer/唐奇安（方案 6.2）
+@@ -29,10 +29,10 @@ GoldTrendEA/
+ | Logger | `CLogger` | 无 | `Info/Warn/Error/WarnThrottled/Notify` |
+ | MarketData | `CMarketData` | Logger | `IsNewBar/Close/SpreadPoints/IsTradingEnvironmentOK` |
+ | Indicators | `CIndicators` | Logger | `Init(句柄创建)/Release/GetValue/DonchianUpper·Lower/AtrSig` |
+-| SignalEngine | `CSignalEngine` | MarketData, Indicators | `Evaluate() → BUY/SELL/NONE`、`IsTrendReversed` |
+-| PositionManager | `CPositionManager` | Logger | `CanOpenNew/CountMyPositions/SyncWithReality/OnPositionClosed/RestoreState` |
+-| RiskManager | `CRiskManager` | Logger | `CalcLots/IsHalted/SpreadOk/IsFridayCloseTime/OnTradeResult` |
+-| TradeExecutor | `CTradeExecutor` | Logger | `Open(重试)/CloseMyPosition/ModifySL/ApplyBreakEven/ApplyAtrTrailing` |
++| SignalEngine | `CSignalEngine` | MarketData, Indicators | `Evaluate/EvaluateCached(同K线缓存) → BUY/SELL/NONE`、`IsTrendReversed(含反向三重信号)` |
++| PositionManager | `CPositionManager` | Logger, RiskManager(可选注入) | `CanOpenNew/CountMyPositions(Tick级缓存)/InvalidateCache/SyncWithReality(兜底盈亏回查)/OnPositionClosed(差异化冷却)/RestoreState/UpdateHeartbeat/单笔持仓级持久化(初始止损距离/保本标记)` |
++| RiskManager | `CRiskManager` | Logger | `CalcLots/IsHalted/SpreadOk/IsFridayCloseTime/OnTradeResult/LastDealTicket` |
++| TradeExecutor | `CTradeExecutor` | Logger | `Open(重试+一单一结二次校验)/CloseMyPosition/ModifySL`（保本/跟踪策略在主 EA 的 `ManagePosition` 中实现） |
+ 
+ 依赖注入均在主 EA 的 `OnInit` 中完成（指针注入），各模块之间不直接互相构造。
+ 
+@@ -44,27 +44,29 @@ GoldTrendEA/
+ 4. 在 MetaEditor 中打开 `GoldTrendEA.mq5` 按 F7 编译；
+ 5. 编译通过后在 MT5 中将 EA 拖到 XAUUSD H1 图表（任意周期均可运行，H1 与内部 `InpSignalTF` 一致最直观），启用「算法交易」。
+ 
+-> 注意：当前为框架版本，可编译、可挂载、可完成"信号评估→开仓→止损止盈→平仓→冷却"的基本闭环，但保本推损/ATR 跟踪/结构点止损等仍为 TODO 骨架，**请勿用于实盘**。
++> 注意：保本推损/ATR+结构点跟踪止损/反向三重信号离场等核心出场功能已实现（第二批 G1~G5/G7/G10），但尚未经方案 7.1 配置的全量回测与模拟盘验证，**请勿用于实盘**。
+ 
+-> 运维提示（日志参数）：VPS 长期运行时请按磁盘容量设置 `InpLogKeepDays`（建议 30/60/90 天，超期旧日志自动清理）；若回测或实盘出现「单日日志超 50MB」WARN，应精简日志级别或提高 `WarnThrottled` 节流窗口。
++> 运维提示（日志参数）：VPS 长期运行时请按磁盘容量设置 `InpLogKeepDays`（建议 30/60/90 天，超期旧日志自动清理）；若回测或实盘出现「单日日志超 50MB」WARN，应精简日志级别或提高 `WarnThrottled` 节流窗口。信号逐层未通过的 Info 日志默认关闭，调试/复盘时开启 `InpVerboseSignalLog` 可附 EMA/ADX/MACD/唐奇安关键数值。
++
++> 运维提示（心跳监控）：EA 每 5 分钟写一次心跳全局变量 `GTEA_<magic>_<symbol>_HEARTBEAT`（值为最近写入时的服务器时间戳），外部看门狗脚本可据此监控 EA 存活（长时间未更新 = EA 已停/终端断线，注意周末无 Tick 时心跳也会暂停）。
+ 
+ ## 后续开发待办（TODO 清单）
+ 
+ 按方案文档里程碑推进，代码内均有 `TODO(阶段, 方案章节)` 标注：
+ 
+ ### M2 策略信号实现
+-- [ ] `SignalEngine::IsTrendReversed`：条件二「完整反向三重信号」——复用 `Evaluate()` 并缓存本根 K 线评估结果，避免重复计算（方案 4.4）
+-- [ ] `GoldTrendEA.mq5::TryOpenPosition`：结构点止损候选 —— `SwingLow/SwingHigh` 外加缓冲，与 ATR 距离取 max（方案 4.4）
++- [x] `SignalEngine::IsTrendReversed`：条件二「完整反向三重信号」——复用 `EvaluateCached()` 同K线缓存评估结果，避免重复计算（方案 4.4，G4 已实现）
++- [ ] `GoldTrendEA.mq5::TryOpenPosition`：结构点止损候选 —— `SwingLow/SwingHigh` 外加缓冲，与 ATR 距离取 max（方案 4.4，仅剩初始止损路径；跟踪路径已含结构点）
+ 
+ ### M3 风控与出场完善
+-- [ ] `TradeExecutor::ApplyBreakEven`：保本推损完整实现；需要在开仓时把**初始止损距离**持久化到全局变量（保本后 `pos.StopLoss()` 已变化）（方案 4.4）
+-- [ ] `TradeExecutor::ApplyAtrTrailing`：ATR 跟踪止损完整实现，含 `InpTrailReplacesTP` 风格开关（方案 4.4）
+-- [ ] `PositionManager::StartCooldown`：亏损/盈利平仓差异化冷却长度（方案 4.3）
+-- [ ] `PositionManager::RestoreState`：重连后首个 Tick 全量对账（SL/TP 与预期一致性校验）（方案 8.2）
++- [x] 保本推损完整实现（主 EA `ApplyBreakEven`，初始止损距离开仓时持久化，保本只推一次）（方案 4.4，G1）
++- [x] ATR+结构点跟踪止损（主 EA `ApplyTrailingStop`，含 `InpTrailReplacesTP` 风格开关）（方案 4.4，G2/G3）
++- [x] `PositionManager::StartCooldown`：亏损/盈利平仓差异化冷却长度（方案 4.3，G5）
++- [x] 重连后 SL/TP 对账（主 EA `ReconcileRestoredStops`，SL 缺失按持久化初始止损距离重建）（方案 8.2，G10）
+ - [ ] `RiskManager::IsNewsBlackout`：新闻时段过滤（手工时间表或经济日历接入，P2 可选）（方案 5.2）
+ 
+ ### M4 回测与优化（方案第 7 章）
+-- [ ] 自定义 `OnTester` 复合优化指标（PF × 回撤组合）
++- [x] 自定义 `OnTester` 复合优化指标（PF × √交易数 ÷ 最大相对回撤%，G7）
+ - [ ] MACD「零轴位置约束」优化开关对比（`SignalEngine::MomentumOk` 内 TODO）
+ 
+ ### P2 增强项
+@@ -74,11 +76,13 @@ GoldTrendEA/
+ 
+ ## 关键设计约定（开发时必须遵守）
+ 
+-- **一单一结不变量**：任何开仓路径必须先经 `CPositionManager::CanOpenNew()`（内部含真实持仓核对）；
++- **一单一结不变量**：任何开仓路径必须先经 `CPositionManager::CanOpenNew()`（内部含真实持仓核对）；`CTradeExecutor::Open()` 发送前另有防御性二次持仓校验（A1，最后一道防线）；
++- **持仓查询 Tick 级缓存**（D1）：`CountMyPositions/HasPosition` 同一 Tick 内复用缓存，`OnTick` 顶部已统一失效；**新增任何开/平仓路径后必须调用 `InvalidateCache()`** 避免脏读；
+ - **真实持仓为唯一事实来源**：新增状态流转逻辑时，勿只依赖内存状态，参考 `SyncWithReality()`（注：OPENING 态无持仓属正常，由主 EA 的 Tick 驱动重试分支处理）；
+ - **信号只用已收盘 K 线**（index ≥ 1），杜绝未来函数；
+ - **风控红线参数**（`InpDailyLossPct/InpWeeklyLossPct/InpRiskPercent`）不参与优化；
+ - 全局变量持久化统一使用各模块 Init 时生成的**实例级前缀** `"GTEA_"+magic+"_"+symbol+"_"`（magic+symbol 组合命名空间，避免多图表同 magic 时冷却/风控状态跨品种污染）；
+ - **多品种/多图表挂载必须为每个实例配置不同的 `InpMagic`**（OnInit 对默认 magic 有防呆 Warn）；如需账户级统一熔断，属后续单独设计（见 TODO 清单 P2）；
+-- **升级兼容说明**：从旧版本（仅按 magic 命名空间）升级到当前版本时，熔断与冷却的持久化命名空间已变为 magic+symbol，**历史状态不会被继承**——升级后当日/本周风控统计与冷却将从 0 重新累积，建议在非交易时段升级，必要时手动清理旧全局变量（前缀 `GTEA_<magic>_`）；
+-- **`STATE_OPENING` 语义**：表示已触发开仓流程、等待 Tick 驱动重试结果的状态，该状态下**可能暂时无真实持仓**，由 `OnTick` 的 `RetryOpenPosition()` 分支负责最终转为 `POSITION_OPEN` 或回退 `IDLE`；后续开发不要将「OPENING + 无持仓」当作异常处理。
++- **升级兼容说明**：从旧版本（仅按 magic 命名空间）升级到当前版本时，熔断与冷却的持久化命名空间已变为 magic+symbol，**历史状态不会被继承**——升级后当日/本周风控统计与冷却将从 0 重新累积，建议在非交易时段升级，必要时手动清理旧全局变量（前缀 `GTEA_<magic>_`）；注意全局变量名上限 63 字符，magic+品种组合过长时会被终端截断（E5 已加超长 ERROR 告警）；
++- **版本号维护**（F1）：升版时同步修改 `Config.mqh` 的 `GTEA_VERSION` 与主 EA 的 `#property version`（MQL5 的 `#property` 不支持宏展开，无法直接引用宏）；
++- **`STATE_OPENING` 语义**：表示已触发开仓流程、等待 Tick 驱动重试结果的状态，该状态下**可能暂时无真实持仓**，由 `OnTick` 的 `RetryOpenPosition()` 分支负责最终转为 `POSITION_OPEN` 或回退 `IDLE`；后续开发不要将「OPENING + 无持仓」当作异常处理；重启后恢复到持久化的 OPENING（待重试参数已丢失）时由 `RestoreState` 直接归为 `IDLE`（E1）。
+diff --git "a/trade/\351\273\204\351\207\221\345\244\226\346\261\207EA\351\241\272\345\212\277\344\270\200\345\215\225\344\270\200\347\273\223\345\274\200\345\217\221\346\226\271\346\241\210.md" "b/trade/\351\273\204\351\207\221\345\244\226\346\261\207EA\351\241\272\345\212\277\344\270\200\345\215\225\344\270\200\347\273\223\345\274\200\345\217\221\346\226\271\346\241\210.md"
+index 337e7c0..e262891 100644
+--- "a/trade/\351\273\204\351\207\221\345\244\226\346\261\207EA\351\241\272\345\212\277\344\270\200\345\215\225\344\270\200\347\273\223\345\274\200\345\217\221\346\226\271\346\241\210.md"
++++ "b/trade/\351\273\204\351\207\221\345\244\226\346\261\207EA\351\241\272\345\212\277\344\270\200\345\215\225\344\270\200\347\273\223\345\274\200\345\217\221\346\226\271\346\241\210.md"
+@@ -1,6 +1,6 @@
+ # 黄金外汇 EA「顺势一单一结」开发方案
+ 
+-> 版本：v1.0　|　目标平台：MetaTrader 5（MQL5）　|　主交易品种：XAUUSD（黄金/美元）
++> 版本：v1.1　|　目标平台：MetaTrader 5（MQL5）　|　主交易品种：XAUUSD（黄金/美元）
+ > 文档性质：完整开发方案，可直接指导后续 EA 编码、回测与上线。
+ 
+ ---
+@@ -16,7 +16,8 @@
+ 7. [回测与参数优化计划](#7-回测与参数优化计划)
+ 8. [部署与运维](#8-部署与运维)
+ 9. [开发计划与里程碑](#9-开发计划与里程碑)
+-10. [风险声明与注意事项](#10-风险声明与注意事项)
++10. [代码审查与优化计划（基于 v0.10 审查结论）](#10-代码审查与优化计划基于-v010-审查结论)
++11. [风险声明与注意事项](#11-风险声明与注意事项)
+ 
+ ---
+ 
+@@ -528,7 +529,92 @@ gantt
+ 
+ ---
+ 
+-## 10. 风险声明与注意事项
++## 10. 代码审查与优化计划（基于 v0.10 审查结论）
++
++> 本章基于对当前实现（GoldTrendEA v0.10：`GoldTrendEA.mq5` 及 `Include/GoldTrendEA/` 下各模块）的全量代码审查结论整理，按问题域分类列出缺陷与优化项，并给出分批实施计划。风险等级：**高**（可能造成实际资金损失或统计失真，须优先修复）、**中**（特定场景下行为不正确）、**低**（健壮性/可维护性改进）。
++
++### 10.1 交易逻辑正确性（A 类）
++
++| 编号 | 风险等级 | 问题描述 | 文件/函数位置 | 优化建议 |
++| --- | --- | --- | --- | --- |
++| A1 | 低 | 一单一结判断到实际下单之间存在窗口期，理论上可能重复开仓 | `GoldTrendEA.mq5::TryOpenPosition` | 在 `Open()` 内部再次调用 `CountMyPositions()` 做防御性二次校验 |
++| A2 | 中 | OPENING 态重试沿用首次计算的 `g_pendingSL/TP`，价格大幅波动后 SL/TP 已不合理 | `GoldTrendEA.mq5::RetryOpenPosition` | 重试时按当前 Ask/Bid 重算 SL/TP，并设置重试超时窗口（如 30 秒），超时放弃回到 IDLE |
++| A3 | 低 | `HistoryDealSelect` 可能因历史未同步而失败；`SyncWithReality` 兜底冷却路径未调用 `g_risk.OnTradeResult` 记录盈亏，导致熔断统计遗漏 | `GoldTrendEA.mq5::OnTradeTransaction` / `SyncWithReality` | 兜底路径从历史成交（HistorySelect + Deal 遍历）补查该笔盈亏后再入账 |
++| A4 | 低 | 趋势反转离场仅随 H1 节奏评估，H4 排列反转的响应可延迟最多 1 根 H1 | `SignalEngine.mqh::TrendDirection` | 增加 H4 新 K 线检测以加速趋势反转离场响应（开仓仍保持 H1 节奏） |
++
++### 10.2 风险管理（B 类）
++
++| 编号 | 风险等级 | 问题描述 | 文件/函数位置 | 优化建议 |
++| --- | --- | --- | --- | --- |
++| B1 | 中 | `NormalizeDouble(lots, 2)` 手数精度硬编码为 2 位，与部分品种的 `SYMBOL_VOLUME_STEP` 不匹配 | `RiskManager.mqh::CalcLots` | 按 `SYMBOL_VOLUME_STEP` 动态计算小数位后再规范化 |
++| B2 | 低 | `Init` 末尾若 `m_dailyBaseEquity == 0`（无历史快照）未初始化基数 | `RiskManager.mqh::Init` | 该情形下主动快照当前净值作为日/周亏损基数 |
++| B3 | 中 | 连亏暂停到期后 `m_consecLosses` 未清零，下一笔亏损立刻再次触发暂停 | `RiskManager.mqh::CheckPeriodReset` | 暂停到期时在 `CheckPeriodReset` 中将连亏计数复位 |
++| B4 | 低 | 保证金占用 50% 阈值硬编码 | `RiskManager.mqh::MarginOk` | 将阈值提取为 input 参数或常量 |
++
++### 10.3 MQL5 健壮性（C 类）
++
++| 编号 | 风险等级 | 问题描述 | 文件/函数位置 | 优化建议 |
++| --- | --- | --- | --- | --- |
++| C1 | 低 | `Release` 释放句柄后未将成员重置，存在悬空句柄误用风险 | `Indicators.mqh::Release` | 释放后将句柄重置为 `INVALID_HANDLE` |
++| C2 | **高** | 平仓无重试逻辑，平仓失败时持仓暴露于反转行情 | `TradeExecutor.mqh::CloseMyPosition` | 增加 2~3 次退避重试，或在 CLOSING 状态下每 Tick 持续尝试直至确认平仓 |
++| C3 | 低 | 直接调用 `HistoryDealSelect` 可能因历史窗口未加载而失败 | 各调用点 | 调用前先执行 `HistorySelect(0, TimeCurrent()+3600)` 加载历史 |
++| C4 | 中 | 买单 SL 校验基准价错误：MT5 规则为买单 SL 相对 Bid（`bid - sl >= minDist`）、买单 TP 相对 Ask，卖单反之；当前用 Ask 校验买单 SL，点差大时会误拒合法止损 | `TradeExecutor.mqh::ValidateStops` | 按 MT5 官方规则修正买/卖单 SL/TP 的校验基准价 |
++| C5 | 低 | 每条日志执行一次 `FileOpen/FileClose`，Tick 级日志场景下开销过大 | `Logger.mqh` | 若引入 Tick 级日志，改为句柄缓存（按日打开、Deinit 关闭） |
++| C6 | 低 | `WarnThrottled` 节流数组无上限，长期运行内存缓慢增长 | `Logger.mqh::WarnThrottled` | 为节流数组增加防御性上限（如 LRU 淘汰或封顶告警） |
++
++### 10.4 性能（D 类）
++
++| 编号 | 风险等级 | 问题描述 | 文件/函数位置 | 优化建议 |
++| --- | --- | --- | --- | --- |
++| D1 | 低 | `HasPosition` 在单个 Tick 内被多次调用、重复遍历持仓 | `PositionManager.mqh::HasPosition` | 增加 Tick 级缓存（同一 Tick 内只遍历一次） |
++| D2 | 低 | 信号评估 Info 日志回测时产生约 37000 条，拖慢回测且淹没关键信息 | 信号评估日志各处 | 增加日志级别开关（回测默认关闭 Info 级信号评估日志） |
++| D3 | 低 | `CheckPeriodReset` 每 Tick 调用 `TimeToStruct` | `RiskManager.mqh::CheckPeriodReset` | 按分钟缓存换算结果，分钟未变化时直接跳过 |
++
++### 10.5 边界与异常场景（E 类）
++
++| 编号 | 风险等级 | 问题描述 | 文件/函数位置 | 优化建议 |
++| --- | --- | --- | --- | --- |
++| E1 | 低 | 重启恢复时若全局变量中 STATE==OPENING，状态语义已失效 | `GoldTrendEA.mq5::RestoreState` | 直接归为 IDLE 并记录日志说明原因 |
++| E2 | **高** | EA 离线期间 SL 被触发（如周末跳空）后重启，`OnTradeResult` 不会被调用，连亏/日亏熔断统计遗漏 | `GoldTrendEA.mq5::OnInit` / `RestoreState` | 启动时查询本 magic 最近平仓成交（历史 Deal），对离线期间的平仓补账入熔断统计 |
++| E3 | 中 | 极端点差下 `ModifySL` 的 `ValidateStops` 可能拒绝合法的跟踪止损修改 | `TradeExecutor.mqh::ModifySL` / `ValidateStops` | 改单场景放宽本地校验（以服务器裁决为准），避免跟踪止损被本地误拦 |
++| E4 | 低 | 未检查品种交易时段，闭市/限制时段下单必然失败 | 开仓前置检查 | 增加交易时段检查（`SymbolInfoSessionTrade`） |
++| E5 | 低 | 全局变量名长度超限（MT5 上限 63 字符）会静默截断 | `GVName` | 对 `GVName` 结果断言长度 ≤ 63 字符 |
++
++### 10.6 可维护性与可测试性（F 类）
++
++| 编号 | 风险等级 | 问题描述 | 文件/函数位置 | 优化建议 |
++| --- | --- | --- | --- | --- |
++| F1 | 低 | 版本号在 `.mq5` 中两处硬编码，易更新遗漏 | `GoldTrendEA.mq5` | 在 `Config.mqh` 统一 `#define GTEA_VERSION` |
++| F2 | 低 | 重试次数(3)、重试间隔(1s)、保证金阈值(50%) 等魔术数字散落各处 | 多处 | 提取为 input 参数或集中常量 |
++| F3 | 中 | 缺少 `OnTester` 自定义复合优化指标，遗传优化只能用内置单一指标 | `GoldTrendEA.mq5` | 实现复合适应度（如 `PF × sqrt(trades) / maxDD`），与 7.2 优化方法配套 |
++| F4 | 低 | 信号评估日志只记录结论，缺少判定依据 | 信号评估日志 | 日志附 EMA/ADX 等实际数值，便于事后诊断 |
++| F5 | 低 | 缺少心跳机制，外部看门狗（8.3 节）无从检测 | `GoldTrendEA.mq5` | 每 5 分钟更新心跳全局变量供外部看门狗检测 |
++
++### 10.7 功能增强（G 类，方案已提及未实现）
++
++| 编号 | 优先级 | 功能 | 现状与说明 |
++| --- | --- | --- | --- |
++| G1/G2/G3 | P0 | 保本推损、ATR 跟踪止损（含 `InpTrailReplacesTP` 开关）、结构点止损（Swing 点与 ATR 止损取优） | 当前为 TODO 骨架，对应 4.4 节核心出场规则，必须实现 |
++| G4 | P1 | 完整反向三重信号离场 | 复用 `Evaluate` 并缓存结果，避免重复计算 |
++| G5 | P1 | 亏损/盈利差异化冷却期 | 对应 4.3 节"亏损与盈利平仓可配置不同冷却长度" |
++| G7 | P1 | `OnTester` 复合适应度 | 与 F3 同项，服务 7.2 参数优化 |
++| G10 | P1 | 重连后 SL/TP 对账校验 | 对应 8.2 节"重连后首个 Tick 全量对账" |
++| G6/G8/G9/G11 | P2 | 新闻时段过滤、图表状态面板、邮件通知与日报、账户级统一熔断 | **本轮不实施**，列为后续里程碑 |
++
++### 10.8 优先级排序与实施计划
++
++| 批次 | 内容 | 包含项 |
++| --- | --- | --- |
++| **第一批** | 修复高优先级缺陷与中优先级缺陷（正确性与资金安全优先） | 高：C2（平仓重试）、E2（离线平仓补账）、C4（SL/TP 校验基准价）；中：A2（重试重算 SL/TP）、B1（手数精度）、B3（连亏计数复位）、E3（改单校验放宽） |
++| **第二批** | 实现核心出场功能与 P1 增强 | G1/G2/G3（保本/ATR 跟踪/结构点止损）、G4（反向三重信号离场）、G5（差异化冷却）、G7（OnTester 复合适应度）、G10（重连对账） |
++| **第三批** | 低优先级健壮性与可维护性项 | A1、A3、A4、B2、B4、C1、C3、C5、C6、D1、D2、D3、E1、E4、E5、F1、F2、F4、F5 |
++| **后续里程碑** | P2 功能增强（本轮不实施） | G6（新闻时段过滤）、G8（图表状态面板）、G9（邮件通知与日报）、G11（账户级统一熔断） |
++
++> 实施约束：每批完成后必须重跑编译与全量回测（按 7.1 配置），确认行为变化可解释后再进入下一批；第一批属缺陷修复，回测结果差异需逐项归因。
++
++---
++
++## 11. 风险声明与注意事项
+ 
+ 1. **市场风险**：任何策略均无法保证盈利。趋势跟随策略在长期震荡市中会持续小额亏损（"回撤钝刀"），需以熔断与冷却机制控制损耗，并对"连亏是策略正常状态的一部分"有心理与资金准备。
+ 2. **过拟合风险**：黄金近年单边牛市显著，样本内优化极易把"做多偏好"误当"策略优势"。必须坚持样本外与 walk-forward 验证，并检查多空两个方向的独立表现。
+@@ -541,4 +627,13 @@ gantt
+ 
+ ---
+ 
+-*文档结束 — GoldTrendEA v1.0 开发方案*
++## 修订记录
++
++| 版本 | 日期 | 修订内容 |
++| --- | --- | --- |
++| v1.0 | 2026-08-13 | 初版完整开发方案 |
++| v1.1 | 2026-08-14 | 新增第 10 章「代码审查与优化计划」，纳入 v0.10 代码审查结论与分批实施计划；原第 10 章顺延为第 11 章 |
++
++---
++
++*文档结束 — GoldTrendEA v1.1 开发方案*

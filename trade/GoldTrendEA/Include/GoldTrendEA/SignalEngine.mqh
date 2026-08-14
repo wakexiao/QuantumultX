@@ -24,6 +24,11 @@ private:
    CIndicators      *m_ind;                // 指标计算层（依赖注入）
    CLogger          *m_logger;
 
+   //--- G4：同一根信号周期K线内的评估结果缓存（开仓评估与持仓期
+   //    反向信号检测共用，避免重复 CopyBuffer 与重复日志）
+   datetime          m_lastEvalBarTime;    // 缓存所属的信号周期K线开盘时间
+   ENUM_SIGNAL_DIR   m_lastEvalDir;        // 缓存的评估结果
+
    //--- 第①②层：趋势方向判定（H4 EMA 排列 + ADX 强度，方案 4.1）
    //    返回 +1 多头 / -1 空头 / 0 震荡或数据不足
    int               TrendDirection()
@@ -125,8 +130,39 @@ private:
       return false;
      }
 
+   //--- D2/F4：各层诊断串（仅 InpVerboseSignalLog=true 时调用，附关键
+   //    指标数值便于复盘；额外 CopyBuffer 只在开启详细日志时发生）
+   string            TrendDiag()
+     {
+      double emaF = 0, emaM = 0, emaS = 0, adx = 0;
+      if(!m_ind.EmaFastTrend(emaF) || !m_ind.EmaMidTrend(emaM) ||
+         !m_ind.EmaSlowTrend(emaS) || !m_ind.AdxTrend(adx))
+         return "趋势层指标数据不足";
+      return StringFormat("EMA%d=%.2f EMA%d=%.2f EMA%d=%.2f ADX=%.1f",
+                          InpEMA_Fast, emaF, InpEMA_Mid, emaM,
+                          InpEMA_Slow, emaS, adx);
+     }
+
+   string            MacdDiag()
+     {
+      double main[], sig[];
+      if(!m_ind.MacdMain(main, 2) || !m_ind.MacdSignal(sig, 2))
+         return "MACD数据不足";
+      return StringFormat("MACD主线=%.3f 信号线=%.3f", main[0], sig[0]);
+     }
+
+   string            BreakoutDiag()
+     {
+      double closeSig = m_market.Close(InpSignalTF, 1);
+      double upper = 0, lower = 0;
+      m_ind.DonchianUpper(upper, InpDonchian_Period);
+      m_ind.DonchianLower(lower, InpDonchian_Period);
+      return StringFormat("收盘=%.2f 唐奇安上轨=%.2f 下轨=%.2f", closeSig, upper, lower);
+     }
+
 public:
-                     CSignalEngine() : m_market(NULL), m_ind(NULL), m_logger(NULL) {}
+                     CSignalEngine() : m_market(NULL), m_ind(NULL), m_logger(NULL),
+                                       m_lastEvalBarTime(0), m_lastEvalDir(SIGNAL_NONE) {}
                     ~CSignalEngine() {}
 
    //--- 初始化：注入行情层、指标层与日志
@@ -139,28 +175,55 @@ public:
      }
 
    //--- 信号评估主入口：仅应在信号周期新 K 线时调用（方案 3.4 主流程）
-   //    三重过滤全部通过才输出方向信号；记录每层过滤结果便于诊断
+   //    三重过滤全部通过才输出方向信号；逐层未通过的 Info 日志默认关闭
+   //    （D2 降噪），InpVerboseSignalLog=true 时输出并附关键指标数值（F4）；
+   //    缓存机制下本函数只在实际评估那次执行，日志不会重复
    ENUM_SIGNAL_DIR   Evaluate()
      {
       int dir = TrendDirection();
       if(dir == 0)
         {
-         m_logger.Info("信号评估: 趋势方向层未通过(震荡/ADX不足/数据不足)");
+         if(InpVerboseSignalLog)
+            m_logger.Info("信号评估: 趋势方向层未通过(震荡/ADX不足/数据不足) [" + TrendDiag() + "]");
          return SIGNAL_NONE;
         }
       if(!MomentumOk(dir))
         {
-         m_logger.Info(StringFormat("信号评估: 方向=%d 通过, MACD动能层未通过", dir));
+         if(InpVerboseSignalLog)
+            m_logger.Info(StringFormat("信号评估: 方向=%d 通过, MACD动能层未通过 [%s]",
+                                       dir, MacdDiag()));
          return SIGNAL_NONE;
         }
       if(!BreakoutOk(dir))
         {
-         m_logger.Info(StringFormat("信号评估: 方向=%d+动能通过, 唐奇安突破层未通过", dir));
+         if(InpVerboseSignalLog)
+            m_logger.Info(StringFormat("信号评估: 方向=%d+动能通过, 唐奇安突破层未通过 [%s]",
+                                       dir, BreakoutDiag()));
          return SIGNAL_NONE;
         }
-      m_logger.Info(StringFormat("信号评估: 三重过滤全部通过, 方向=%s",
-                                 dir > 0 ? "BUY" : "SELL"));
+      // 三重过滤全部通过属关键事件，始终记录；详细日志时附全层指标值
+      m_logger.Info(StringFormat("信号评估: 三重过滤全部通过, 方向=%s%s",
+                                 dir > 0 ? "BUY" : "SELL",
+                                 InpVerboseSignalLog
+                                 ? " [" + TrendDiag() + " " + MacdDiag() + " " + BreakoutDiag() + "]"
+                                 : ""));
       return (dir > 0) ? SIGNAL_BUY : SIGNAL_SELL;
+     }
+
+   //--- G4：带同K线缓存的评估入口 —— 同一根信号周期K线内重复调用
+   //    直接返回缓存结果，避免开仓评估与反向离场检测重复计算指标
+   ENUM_SIGNAL_DIR   EvaluateCached()
+     {
+      datetime barTime = m_market.BarTime(InpSignalTF, 0);
+      if(barTime > 0 && barTime == m_lastEvalBarTime)
+         return m_lastEvalDir;             // 本根K线已评估过，直接取缓存
+      ENUM_SIGNAL_DIR dir = Evaluate();
+      if(barTime > 0)                      // 历史未同步(barTime=0)时不缓存
+        {
+         m_lastEvalBarTime = barTime;
+         m_lastEvalDir     = dir;
+        }
+      return dir;
      }
 
    //--- 趋势反转检测（持仓管理期调用，方案 4.4「趋势反转强制离场」）
@@ -174,9 +237,19 @@ public:
          if(posDir > 0 && emaF < emaM) return true;
          if(posDir < 0 && emaF > emaM) return true;
         }
-      // 条件二：出现完整的反向三重信号
-      // TODO(M2, 方案 4.4)：调用 Evaluate() 判断是否输出与持仓相反的信号；
-      //      注意避免与开仓评估重复计算，可缓存本根K线的评估结果
+      // 条件二（G4）：出现完整的反向三重信号（方向+动能+突破全部
+      // 反向成立）—— 复用带缓存的 Evaluate，同一根K线内不重复计算
+      ENUM_SIGNAL_DIR sig = EvaluateCached();
+      if(posDir > 0 && sig == SIGNAL_SELL)
+        {
+         m_logger.Info("反转检测: 持多单期间出现完整反向三重卖出信号");
+         return true;
+        }
+      if(posDir < 0 && sig == SIGNAL_BUY)
+        {
+         m_logger.Info("反转检测: 持空单期间出现完整反向三重买入信号");
+         return true;
+        }
       return false;
      }
   };
