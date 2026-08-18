@@ -25,7 +25,7 @@ GoldRangeEA/
 | v1 条款 | 实现（文件::函数） |
 |---|---|
 | §2.1 箱体定义（N 根最高/最低） | `BoxEngine.mqh::CBoxEngine::OnNewBar`（批量 CopyHigh/CopyLow + 线性扫描） |
-| §2.2-1/2 高度 ∈ [15,80] 点过滤 | `BoxEngine::OnNewBar` 高度过滤分支 |
+| §2.2-1/2 高度过滤（默认 [400,2000] 点，D5 重标定） | `BoxEngine::OnNewBar` 高度过滤分支 |
 | §2.2-3 触碰次数 ≥2 | `BoxEngine::OnNewBar` 第二趟触碰计数（容差 `InpTouchTolerance`） |
 | §2.2-4 ADX ≤25 | `BoxEngine::OnNewBar` ADX 过滤（`Indicators::AdxValue`） |
 | §2.3 每根新 K 线刷新箱体 | `GoldRangeEA.mq5::OnTick` ③ → `BoxEngine::OnNewBar` |
@@ -39,11 +39,11 @@ GoldRangeEA/
 | §5.2 止损（高度×0.4，置于箱体外侧） | `BoxEngine::CalcStops`（min/max 取箱体外侧价） |
 | §5.3 盈亏比 ≥1.2 否则放弃 | `BoxEngine::CheckMinRR` + `OnTick` ⑧（INFO 日志放弃） |
 | §5.4 时间止损 4 小时 | `GoldRangeEA.mq5::ManagePosition` ② |
-| §6.1 日亏损 10 美元（净额口径） | `RiskManager::OnTradeResult/IsHalted/CheckPeriodReset`（盈利抵扣、次日复位） |
+| §6.1 日亏损熔断（默认 100 美元，D6） | `RiskManager::OnTradeResult/IsHalted/CheckPeriodReset`（盈利抵扣、次日复位） |
 | §6.2 连亏 3 笔暂停 30 分钟 | `RiskManager::OnTradeResult/CheckPeriodReset`（PAUSE_UNTIL 持久化） |
 | §6.3 同一时间最多 1 单 | `PositionManager::CountMyPositions/CanOpenNew` + `TradeExecutor::Open` 二次防御 |
-| §6.4 固定手数 0.01 | `RiskManager::FixedLots`（MIN/MAX/STEP 归一化） |
-| §七 23 项参数 | `Config.mqh`（默认值逐项照抄） |
+| §6.4 固定手数（默认 0.1，D6） | `RiskManager::FixedLots`（MIN/MAX/STEP 归一化） |
+| §七 23 项参数 | `Config.mqh`（默认值经 D5 重标定，条款语义不变） |
 | §八-1/2/3 无加仓/无多单/无对冲 | 状态机仅 IDLE→…→POSITION_OPEN 单笔路径，无第二开仓路径 |
 | §八-4 每单必带 SL/TP | `GoldRangeEA::TryOpenPosition`（市价单带 SL/TP 下单，无裸单路径） |
 | §八-5 禁按浮亏调手数 | 无浮亏相关手数逻辑，仅 `FixedLots` |
@@ -65,6 +65,16 @@ GoldRangeEA/
   原生 KDJ，此为业界标准近似；J 值对超买超卖的灵敏度高于 K/D，符合 v1 §3.1/3.2 语义。
 - **D4 点值固定 1 点 = 0.01 美元，不依赖 SYMBOL_POINT**（v1 §十-1）：3 位小数报价的
   经纪商上全部「N 点」参数语义不变；`SYMBOL_POINT ≠ 0.01` 时 OnInit 仅 WARN 提示不拒启。
+- **D5 默认参数按黄金实际波动重标定（2026-08-18，用户确认）**：v1 §七 原默认刻度
+  （箱体 60 根/15~80 点、容差 3 点、突破 5 点）在 1 点=0.01 美元口径下与 XAUUSD 实际
+  波动差 1~2 个数量级（实盘实测 60 根 M15 高低区间约 6000 点，箱体永不形成、EA 永不
+  开单）。重标定：箱体 24 根（6 小时窗口）、高度 [400,2000] 点（$4~$20）、触碰/入场
+  容差 30 点（$0.30）、突破确认 50 点（$0.50）；条款语义不变仅刻度变化，KDJ/ADX/比例
+  类参数不受影响。正式启用前建议按 §十-2 回测验证。
+- **D6 固定手数 0.01 → 0.1 + 日亏熔断 10 → 100 美元（2026-08-18，用户确认）**：0.1 手
+  = 10 盎司，价格每波动 1 美元 ≈ 盈亏 10 美元；D5 刻度下单笔止损风险约 $16（400 点
+  箱）~$80（2000 点箱），日亏上限同步上调至 100 美元（约 1~6 单止损额度），保持风控
+  刻度与手数匹配。
 
 ## 构建与部署
 
@@ -81,10 +91,9 @@ GoldRangeEA/
 - **InpMaxSpreadPoints=50（v1 规格外保护）**：v1 未要求点差过滤，属实盘保护性安全网；
   设 0 可完全关闭（直通）。参数按 1 点=0.01 美元口径解释，内部以 Ask-Bid 价格差比较，
   2 位/3 位小数报价的经纪商上语义一致（评审修复 F1）。
-- **最小箱体 15 点时 SL 仅 6 点**（15×0.4，模式 A 下 TP 7.5 点）：若券商
-  `SYMBOL_TRADE_STOPS_LEVEL` > 6 点，开仓将被停损距校验拒绝（日志 ERROR「SL/TP 不满足
-  最小停损距」后放弃）；此时可调大 `InpBoxMinPoints` 或 `InpSLRatio`，或换止损位更宽
-  的券商账户。
+- **停损距安全边际（D5 重标定后）**：最小箱体 400 点时 SL=160 点（$1.60）、模式 A
+  TP=200 点（$2.00），远高于常见券商的 `SYMBOL_TRADE_STOPS_LEVEL`；若仍出现「SL/TP
+  不满足最小停损距」ERROR 放弃开仓，可调大 `InpBoxMinPoints` 或 `InpSLRatio`。
 - 持久化全局变量前缀 `GREA_{magic}_{symbol}_`：多图表挂载请为每个图表配置不同 magic。
 - **Netting（净持仓）账户警示**：同品种手动交易会与 EA 持仓合并导致 magic 漂移，EA
   会漏管持仓并可能重复开仓——Netting 账户请勿手动交易同品种，建议用 Hedging 账户

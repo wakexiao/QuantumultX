@@ -12,7 +12,7 @@
 
 //--- EA 版本号统一定义（日志头等处引用；#property version 不支持宏展开，
 //    主 EA 中的 #property 需随本宏同步手工更新）
-#define GREA_VERSION  "1.00"
+#define GREA_VERSION  "1.04"
 
 //--- 信号方向枚举（BoxEngine 输出）
 enum ENUM_SIGNAL_DIR
@@ -36,14 +36,17 @@ input long              InpMagic            = 88888;      // EA 魔术号（持�
 input ENUM_TIMEFRAMES   InpSignalTF         = PERIOD_M15; // 箱体/信号周期（新K线刷新箱体）
 
 //=== 箱体识别（v1 §2.1 / §2.2）======================================
-input int               InpBoxBars          = 60;         // 箱体统计K线数量（§2.1 最近 N 根）
-input int               InpBoxMinPoints     = 15;         // 箱体最小高度/点（§2.2-1，太小无利润空间）
-input int               InpBoxMaxPoints     = 80;         // 箱体最大高度/点（§2.2-2，太大已是趋势）
-input int               InpTouchTolerance   = 3;          // 触碰容差/点（§2.2-3 到达上下沿±范围算触碰）
+// 默认刻度按 2026-08-18 实盘实测重标定（README 决策记录 D5）：v1 §七 原默认
+// （60 根/15~80 点/容差 3 点）在 1 点=$0.01 口径下与 XAUUSD 实际波动差 1~2 个
+// 数量级（实测 60 根 M15 高低区间约 6000 点），箱体永不形成、EA 永不交易
+input int               InpBoxBars          = 24;         // 箱体统计K线数量（§2.1 最近 N 根；24 根=6 小时窗口）
+input int               InpBoxMinPoints     = 400;        // 箱体最小高度/点（§2.2-1，太小无利润空间）
+input int               InpBoxMaxPoints     = 2000;       // 箱体最大高度/点（§2.2-2，太大已是趋势）
+input int               InpTouchTolerance   = 30;         // 触碰容差/点（§2.2-3 到达上下沿±范围算触碰）
 input int               InpMinTouches       = 2;          // 上下沿最小触碰次数（§2.2-3 各至少 N 次）
 
 //=== 入场条件（v1 §3.1 / §3.2 / §3.3）===============================
-input int               InpEntryTolerance   = 3;          // 入场容差/点（§3.1/3.2 到达上下沿±范围可入场）
+input int               InpEntryTolerance   = 30;         // 入场容差/点（§3.1/3.2 到达上下沿±范围可入场）
 input int               InpKDJ_K            = 9;          // KDJ K 周期（§七：9,3,3）
 input int               InpKDJ_D            = 3;          // KDJ D 周期（§七：9,3,3）
 input int               InpKDJ_Slowing      = 3;          // KDJ 慢化周期（§七：9,3,3）
@@ -55,17 +58,17 @@ input int               InpADX_Period       = 14;         // ADX 周期（震荡
 input int               InpADX_Threshold    = 25;         // ADX 趋势阈值（>此值禁止开新仓，§4.1）
 
 //=== 手数与出场（v1 §5.1/5.2/5.3/5.4、§6.4）=========================
-input double            InpFixedLots        = 0.01;       // 固定手数（§6.4，禁动态调整）
+input double            InpFixedLots        = 0.1;        // 固定手数（§6.4，禁动态调整；0.1手=10盎司，1美元波动≈$10）
 input ENUM_TP_MODE      InpTPMode           = TP_MODE_RATIO; // 止盈模式（§5.1：A=高度比例/B=箱体对侧）
 input double            InpTPRatio          = 0.5;        // 止盈比例（§5.1 模式A：止盈=箱体高度×此值）
 input double            InpSLRatio          = 0.4;        // 止损比例（§5.2：止损=箱体高度×此值）
 input double            InpMinRR            = 1.2;        // 最小盈亏比（§5.3：低于此值放弃开仓）
-input int               InpBreakoutPoints   = 5;          // 突破确认点数（§4.2：突破箱体 N 点确认并止损）
+input int               InpBreakoutPoints   = 50;         // 突破确认点数（§4.2：突破箱体 N 点确认并止损）
 input int               InpMaxHoldHours     = 4;          // 最大持仓时间/小时（§5.4：超时强制平仓）
 
 //=== 交易节奏与全局风控（v1 §3.1/3.2、§6.1、§6.2）====================
 input int               InpMinTradeIntervalMin = 5;       // 两笔订单最小间隔/分钟（§3.1/3.2 防频繁交易）
-input double            InpMaxDailyLossUSD  = 10.0;       // 最大日亏损/美元（§6.1：当日净亏达此值停止开仓）
+input double            InpMaxDailyLossUSD  = 100.0;      // 最大日亏损/美元（§6.1：当日净亏达此值停止开仓；与0.1手风险刻度匹配，D6）
 input int               InpMaxConsecSL      = 3;          // 连续止损暂停次数（§6.2：连亏 N 笔后暂停）
 input int               InpPauseMinutes     = 30;         // 暂停时长/分钟（§6.2：暂停期满自动恢复）
 

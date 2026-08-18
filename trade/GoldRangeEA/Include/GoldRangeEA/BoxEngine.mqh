@@ -120,7 +120,7 @@ public:
         }
       double height = upper - lower;
 
-      //--- ③ 高度过滤（v1 §2.2-1/2：[15,80] 点，太小无利润/太大是趋势）
+      //--- ③ 高度过滤（v1 §2.2-1/2：太小无利润/太大是趋势；默认 [400,2000] 点，D5 重标定）
       if(height < PtsToPrice(InpBoxMinPoints))
          reason = StringFormat("高度 %.1f 点 < 最小 %d 点",
                                height / GREA_POINT_VALUE, InpBoxMinPoints);
