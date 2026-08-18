@@ -477,7 +477,7 @@ void ManagePosition()
    //    InpMaxHoldHours=0 视为禁用该功能（防误配置导致持仓秒平）
    if(InpMaxHoldHours > 0)
      {
-      long heldSec = (long)(TimeCurrent() - (datetime)pos.PositionTime());
+      long heldSec = (long)(TimeCurrent() - pos.Time());
       if(heldSec > (long)InpMaxHoldHours * 3600)
          ClosePosition(StringFormat("时间止损: 持仓 %.1f 小时 > %d 小时(§5.4)",
                                     heldSec / 3600.0, InpMaxHoldHours));

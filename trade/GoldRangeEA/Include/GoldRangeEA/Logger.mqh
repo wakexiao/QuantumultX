@@ -61,9 +61,10 @@ private:
          CleanupOldLogs();
         }
       // 按日期滚动的日志文件：追加写入 Files/GoldRangeEA/yyyymmdd.log
-      // （评审修复 F9：FILE_UTF8 替代 FILE_ANSI，中文日志在英文系统上
-      //  不再乱码，MT5 Build 2360+ 支持）
-      int h = FileOpen(m_dir + today, FILE_READ|FILE_WRITE|FILE_TXT|FILE_UTF8);
+      // （评审修复 F9：日志按 UTF-8 编码落盘，中文日志在英文系统上不再
+      //  乱码。注意 MQL5 并无 FILE_UTF8 标志，UTF-8 须以二进制模式手工
+      //  编码：StringToCharArray(CP_UTF8) 转字节流后 FileWriteArray 写入）
+      int h = FileOpen(m_dir + today, FILE_READ|FILE_WRITE|FILE_BIN);
       if(h == INVALID_HANDLE)
         {
          // 修复四：打开失败除 Print 外推送告警（仅一次，先置位防递归）
@@ -76,7 +77,17 @@ private:
          return;
         }
       FileSeek(h, 0, SEEK_END);
-      FileWriteString(h, line + "\r\n");
+      // 当日首条（文件为空）先写 UTF-8 BOM，编辑器可自动识别编码
+      if(FileTell(h) == 0)
+        {
+         uchar bom[] = {0xEF, 0xBB, 0xBF};
+         FileWriteArray(h, bom, 0, ArraySize(bom));
+        }
+      // StringToCharArray 返回字节数含结尾 '\0'，写 n-1 剔除终止符
+      uchar utf8[];
+      int n = StringToCharArray(line + "\r\n", utf8, 0, WHOLE_ARRAY, CP_UTF8);
+      if(n > 1)
+         FileWriteArray(h, utf8, 0, n - 1);
       long fsize = FileSize(h);
       FileClose(h);
       // 修复四：单日文件超过阈值写一条 WARN（先置位防递归，只提示一次）
