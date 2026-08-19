@@ -25,7 +25,7 @@ GoldRangeEA/
 | v1 条款 | 实现（文件::函数） |
 |---|---|
 | §2.1 箱体定义（N 根最高/最低） | `BoxEngine.mqh::CBoxEngine::OnNewBar`（批量 CopyHigh/CopyLow + 线性扫描） |
-| §2.2-1/2 高度过滤（默认 [400,2000] 点，D5 重标定） | `BoxEngine::OnNewBar` 高度过滤分支 |
+| §2.2-1/2 高度过滤（默认 [400,3000] 点，D5 重标定 / D7 上调） | `BoxEngine::OnNewBar` 高度过滤分支 |
 | §2.2-3 触碰次数 ≥2 | `BoxEngine::OnNewBar` 第二趟触碰计数（容差 `InpTouchTolerance`） |
 | §2.2-4 ADX ≤25 | `BoxEngine::OnNewBar` ADX 过滤（`Indicators::AdxValue`） |
 | §2.3 每根新 K 线刷新箱体 | `GoldRangeEA.mq5::OnTick` ③ → `BoxEngine::OnNewBar` |
@@ -39,11 +39,11 @@ GoldRangeEA/
 | §5.2 止损（高度×0.4，置于箱体外侧） | `BoxEngine::CalcStops`（min/max 取箱体外侧价） |
 | §5.3 盈亏比 ≥1.2 否则放弃 | `BoxEngine::CheckMinRR` + `OnTick` ⑧（INFO 日志放弃） |
 | §5.4 时间止损 4 小时 | `GoldRangeEA.mq5::ManagePosition` ② |
-| §6.1 日亏损熔断（默认 100 美元，D6） | `RiskManager::OnTradeResult/IsHalted/CheckPeriodReset`（盈利抵扣、次日复位） |
+| §6.1 日亏损熔断（默认 200 美元，D6/D7） | `RiskManager::OnTradeResult/IsHalted/CheckPeriodReset`（盈利抵扣、次日复位） |
 | §6.2 连亏 3 笔暂停 30 分钟 | `RiskManager::OnTradeResult/CheckPeriodReset`（PAUSE_UNTIL 持久化） |
 | §6.3 同一时间最多 1 单 | `PositionManager::CountMyPositions/CanOpenNew` + `TradeExecutor::Open` 二次防御 |
 | §6.4 固定手数（默认 0.1，D6） | `RiskManager::FixedLots`（MIN/MAX/STEP 归一化） |
-| §七 23 项参数 | `Config.mqh`（默认值经 D5 重标定，条款语义不变） |
+| §七 23 项参数 | `Config.mqh`（默认值经 D5 重标定、D7 调整，条款语义不变） |
 | §八-1/2/3 无加仓/无多单/无对冲 | 状态机仅 IDLE→…→POSITION_OPEN 单笔路径，无第二开仓路径 |
 | §八-4 每单必带 SL/TP | `GoldRangeEA::TryOpenPosition`（市价单带 SL/TP 下单，无裸单路径） |
 | §八-5 禁按浮亏调手数 | 无浮亏相关手数逻辑，仅 `FixedLots` |
@@ -75,6 +75,13 @@ GoldRangeEA/
   = 10 盎司，价格每波动 1 美元 ≈ 盈亏 10 美元；D5 刻度下单笔止损风险约 $16（400 点
   箱）~$80（2000 点箱），日亏上限同步上调至 100 美元（约 1~6 单止损额度），保持风控
   刻度与手数匹配。
+- **D7 箱体高度上限 2000 → 3000 点 + 日亏熔断 100 → 200 美元 + 详细日志默认开启（2026-08-19，用户确认）**：
+  两个终端连续两天实测（2026-08-18~19），6 小时窗高度全部落在 $28~43（3045/4284/2823 点），
+  均超 2000 点上限——箱体从未形成、EA 全天零开单，高度是唯一生效的拦截（KDJ/ADX/触碰从未被
+  评估到）。上调至 3000 点（$30）适配当前波动体制：3000 点箱单笔止损 $120（0.4×$30×10 盎
+  司）、止盈 $150；日亏上限同步上调至 200 美元（约 1.7 单止损额度）保持风控刻度匹配。
+  `InpVerboseSignalLog` 默认改为 true：实测每次重挂 EA 该开关重置为 false，导致箱体未形成时
+  日志长时间静默（翻转日志不受门控，可证箱体从未有效），诊断期默认开启。
 
 ## 构建与部署
 

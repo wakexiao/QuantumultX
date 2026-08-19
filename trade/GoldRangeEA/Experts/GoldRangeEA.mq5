@@ -11,7 +11,7 @@
 #property link      ""
 // 版本号与 Config.mqh 的 GREA_VERSION 保持同步（#property 不支持
 // 宏展开，升版时两处同步修改）
-#property version   "1.04"
+#property version   "1.05"
 #property description "箱体震荡高抛低吸一单一结EA：M15箱体识别+KDJ超买超卖+ADX趋势过滤，同一时刻最多1单"
 #property strict
 

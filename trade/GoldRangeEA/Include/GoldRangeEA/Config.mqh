@@ -12,7 +12,7 @@
 
 //--- EA 版本号统一定义（日志头等处引用；#property version 不支持宏展开，
 //    主 EA 中的 #property 需随本宏同步手工更新）
-#define GREA_VERSION  "1.04"
+#define GREA_VERSION  "1.05"
 
 //--- 信号方向枚举（BoxEngine 输出）
 enum ENUM_SIGNAL_DIR
@@ -41,7 +41,7 @@ input ENUM_TIMEFRAMES   InpSignalTF         = PERIOD_M15; // 箱体/信号周期
 // 数量级（实测 60 根 M15 高低区间约 6000 点），箱体永不形成、EA 永不交易
 input int               InpBoxBars          = 24;         // 箱体统计K线数量（§2.1 最近 N 根；24 根=6 小时窗口）
 input int               InpBoxMinPoints     = 400;        // 箱体最小高度/点（§2.2-1，太小无利润空间）
-input int               InpBoxMaxPoints     = 2000;       // 箱体最大高度/点（§2.2-2，太大已是趋势）
+input int               InpBoxMaxPoints     = 3000;       // 箱体最大高度/点（§2.2-2，太大已是趋势；D7 上调适配实测波动体制）
 input int               InpTouchTolerance   = 30;         // 触碰容差/点（§2.2-3 到达上下沿±范围算触碰）
 input int               InpMinTouches       = 2;          // 上下沿最小触碰次数（§2.2-3 各至少 N 次）
 
@@ -68,7 +68,7 @@ input int               InpMaxHoldHours     = 4;          // 最大持仓时间/
 
 //=== 交易节奏与全局风控（v1 §3.1/3.2、§6.1、§6.2）====================
 input int               InpMinTradeIntervalMin = 5;       // 两笔订单最小间隔/分钟（§3.1/3.2 防频繁交易）
-input double            InpMaxDailyLossUSD  = 100.0;      // 最大日亏损/美元（§6.1：当日净亏达此值停止开仓；与0.1手风险刻度匹配，D6）
+input double            InpMaxDailyLossUSD  = 200.0;      // 最大日亏损/美元（§6.1：当日净亏达此值停止开仓；与0.1手风险刻度匹配，D6/D7）
 input int               InpMaxConsecSL      = 3;          // 连续止损暂停次数（§6.2：连亏 N 笔后暂停）
 input int               InpPauseMinutes     = 30;         // 暂停时长/分钟（§6.2：暂停期满自动恢复）
 
@@ -77,7 +77,7 @@ input int               InpMaxSpreadPoints  = 50;         // 最大允许点差/
 
 //=== 日志与运维 =====================================================
 input int               InpLogKeepDays      = 30;         // 日志保留天数（超期旧日志自动清理）
-input bool              InpVerboseSignalLog = false;      // 信号评估详细日志：逐级未通过原因+指标数值（调试用）
+input bool              InpVerboseSignalLog = true;       // 信号评估详细日志：逐级未通过原因+指标数值（D7 起默认开启）
 
 //=== 点值语义（v1 §十-1）============================================
 //    1 点 = 0.01 美元（XAUUSD 报价小数点后第二位变动 1）。
