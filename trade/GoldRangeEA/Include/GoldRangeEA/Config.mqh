@@ -12,7 +12,7 @@
 
 //--- EA 版本号统一定义（日志头等处引用；#property version 不支持宏展开，
 //    主 EA 中的 #property 需随本宏同步手工更新）
-#define GREA_VERSION  "1.05"
+#define GREA_VERSION  "1.06"
 
 //--- 信号方向枚举（BoxEngine 输出）
 enum ENUM_SIGNAL_DIR
@@ -33,13 +33,13 @@ enum ENUM_TP_MODE
 input long              InpMagic            = 88888;      // EA 魔术号（持仓过滤唯一标识）
 
 //=== 周期设置（v1 §一：M15 主周期，可参数调整）=======================
-input ENUM_TIMEFRAMES   InpSignalTF         = PERIOD_M15; // 箱体/信号周期（新K线刷新箱体）
+input ENUM_TIMEFRAMES   InpSignalTF         = PERIOD_M5;  // 箱体/信号周期（新K线刷新箱体；D8：M15→M5，v1 §一 允许周期参数化）
 
 //=== 箱体识别（v1 §2.1 / §2.2）======================================
 // 默认刻度按 2026-08-18 实盘实测重标定（README 决策记录 D5）：v1 §七 原默认
 // （60 根/15~80 点/容差 3 点）在 1 点=$0.01 口径下与 XAUUSD 实际波动差 1~2 个
 // 数量级（实测 60 根 M15 高低区间约 6000 点），箱体永不形成、EA 永不交易
-input int               InpBoxBars          = 24;         // 箱体统计K线数量（§2.1 最近 N 根；24 根=6 小时窗口）
+input int               InpBoxBars          = 24;         // 箱体统计K线数量（§2.1 最近 N 根；24 根 M5=2 小时窗口，D8）
 input int               InpBoxMinPoints     = 400;        // 箱体最小高度/点（§2.2-1，太小无利润空间）
 input int               InpBoxMaxPoints     = 3000;       // 箱体最大高度/点（§2.2-2，太大已是趋势；D7 上调适配实测波动体制）
 input int               InpTouchTolerance   = 30;         // 触碰容差/点（§2.2-3 到达上下沿±范围算触碰）

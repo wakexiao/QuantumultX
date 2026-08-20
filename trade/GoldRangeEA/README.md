@@ -1,6 +1,6 @@
 # GoldRangeEA — 黄金箱体震荡高抛低吸（一单一结）
 
-MT5 EA。自动识别 XAUUSD M15 横盘震荡区间（箱体），在上沿压力位做空、下沿支撑位做多；
+MT5 EA。自动识别 XAUUSD M5 横盘震荡区间（箱体），在上沿压力位做空、下沿支撑位做多；
 每单独立开仓、独立止盈止损，禁止加仓/扛单/马丁；行情突破箱体走出趋势时自动暂停开仓。
 需求唯一事实来源：`../GoldTrendEA/v1.md`（下文条款号均指向该文档）。
 
@@ -43,7 +43,7 @@ GoldRangeEA/
 | §6.2 连亏 3 笔暂停 30 分钟 | `RiskManager::OnTradeResult/CheckPeriodReset`（PAUSE_UNTIL 持久化） |
 | §6.3 同一时间最多 1 单 | `PositionManager::CountMyPositions/CanOpenNew` + `TradeExecutor::Open` 二次防御 |
 | §6.4 固定手数（默认 0.1，D6） | `RiskManager::FixedLots`（MIN/MAX/STEP 归一化） |
-| §七 23 项参数 | `Config.mqh`（默认值经 D5 重标定、D7 调整，条款语义不变） |
+| §七 23 项参数 | `Config.mqh`（默认值经 D5 重标定、D7/D8 调整，条款语义不变） |
 | §八-1/2/3 无加仓/无多单/无对冲 | 状态机仅 IDLE→…→POSITION_OPEN 单笔路径，无第二开仓路径 |
 | §八-4 每单必带 SL/TP | `GoldRangeEA::TryOpenPosition`（市价单带 SL/TP 下单，无裸单路径） |
 | §八-5 禁按浮亏调手数 | 无浮亏相关手数逻辑，仅 `FixedLots` |
@@ -82,6 +82,13 @@ GoldRangeEA/
   司）、止盈 $150；日亏上限同步上调至 200 美元（约 1.7 单止损额度）保持风控刻度匹配。
   `InpVerboseSignalLog` 默认改为 true：实测每次重挂 EA 该开关重置为 false，导致箱体未形成时
   日志长时间静默（翻转日志不受门控，可证箱体从未有效），诊断期默认开启。
+- **D8 箱体信号周期 M15 → M5（24 根 = 2 小时窗口）（2026-08-20，用户确认）**：v1.05 运行后
+  开单仍少，用户目标每日 2~3 单。24 根 M5 窗高度约为 24 根 M15（6 小时）窗的四成（当前
+  行情估 $10~17，天然落入 [400,3000] 点区间），箱体形成率大幅提高；KDJ/ADX 随周期加快，
+  J 值触及超买超卖更频繁，入场机会成比例增加。代价：M5 噪声更高、2 小时箱体多为盘中整
+  理段（信号质量低于 6 小时箱），点差摩擦随频率成比例上升——以质量换频率属用户知情选择。
+  触碰计数统计基础不变（仍 24 根）；§5.4 时间止损暂维持 4 小时，若频率仍不足下一杠杆为
+  InpMaxHoldHours 降至 2。
 
 ## 构建与部署
 
@@ -90,7 +97,7 @@ GoldRangeEA/
 2. 目录导入 MQL5：将 `Include/GoldRangeEA/` 拷入 `MQL5/Include/`，将
    `Experts/GoldRangeEA.mq5` 拷入 `MQL5/Experts/`，MetaEditor 中按 F7 编译；
    日志输出到 `MQL5/Files/GoldRangeEA/yyyymmdd.log`。
-3. 回测建议（v1 §十-2）：近 1 年 XAUUSD M15，「仅开盘价」之外的每 Tick 模式（入场为
+3. 回测建议（v1 §十-2）：近 1 年 XAUUSD M5（D8 信号周期），「仅开盘价」之外的每 Tick 模式（入场为
    Tick 级）；重点观察：震荡段胜率与盈利、ADX>25 时段零开仓、最大回撤是否可控。
 
 ## 安全网与边界提示
