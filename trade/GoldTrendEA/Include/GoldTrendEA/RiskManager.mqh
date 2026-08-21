@@ -238,14 +238,26 @@ public:
       return false;
      }
 
-   //--- 点差过滤：当前点差 > 阈值时放弃本次信号（方案 5.2）
+   //--- 点差过滤：当前实际点差 > 阈值时放弃本次信号（方案 5.2）
+   //    v0.30 修复：改用 Ask−Bid 价格差与 PtsToPrice(阈值) 比较（统一美元口径），
+   //    解决 3 位小数报价经纪商上 SYMBOL_SPREAD 返回 300-500 原生点数永远超过
+   //    固定阈值 45 导致所有开仓被拦死的 Bug（参照 GoldRangeEA 正确实现）
    bool              SpreadOk()
      {
-      long spread = SymbolInfoInteger(m_symbol, SYMBOL_SPREAD);
-      if(spread > InpMaxSpreadPoints)
+      if(InpMaxSpreadPoints <= 0)
+         return true;                     // 0 或负值 = 关闭点差过滤
+      double ask = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+      if(ask <= 0 || bid <= 0)
+         return true;                     // 报价异常不拦截，后续流程自会失败
+      double spread = ask - bid;          // 实际价差（美元口径）
+      if(spread > PtsToPrice(InpMaxSpreadPoints))
         {
-         m_logger.Warn(StringFormat("点差过滤: 当前 %d 点 > 阈值 %d 点, 放弃信号",
-                                    spread, InpMaxSpreadPoints));
+         m_logger.WarnThrottled("spread",
+                                StringFormat("点差过滤: 当前 %.1f 点($%.3f) > 阈值 %d 点($%.2f), 放弃信号",
+                                             spread / GTEA_POINT_VALUE, spread,
+                                             InpMaxSpreadPoints, PtsToPrice(InpMaxSpreadPoints)),
+                                60);
          return false;
         }
       return true;

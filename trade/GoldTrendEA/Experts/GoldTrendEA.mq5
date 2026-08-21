@@ -10,7 +10,7 @@
 #property link      ""
 // F1：版本号与 Config.mqh 的 GTEA_VERSION 保持同步（#property 不支持
 //     宏展开，升版时两处同步修改）
-#property version   "0.20"
+#property version   "0.30"
 #property description "顺势一单一结 EA 框架：H4趋势+H1三重过滤，同一时刻最多1单"
 #property strict
 
@@ -67,6 +67,16 @@ int OnInit()
    if(InpRiskPercent <= 0 || InpRiskPercent > 5.0)
      {
       g_logger.Error("参数校验失败: InpRiskPercent 须在 (0, 5] 区间");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if(InpMACD_Window < 1 || InpMACD_Window > 50)
+     {
+      g_logger.Error("参数校验失败: InpMACD_Window 须在 [1, 50] 区间");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if(InpDonchian_Period < 2 || InpDonchian_Period > 100)
+     {
+      g_logger.Error("参数校验失败: InpDonchian_Period 须在 [2, 100] 区间");
       return INIT_PARAMETERS_INCORRECT;
      }
 

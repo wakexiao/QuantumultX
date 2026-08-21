@@ -11,7 +11,7 @@
 
 //--- F1：EA 版本号统一定义（日志头等处引用；#property version 不支持
 //    宏展开，主 EA 中的 #property 需随本宏同步手工更新）
-#define GTEA_VERSION  "0.20"
+#define GTEA_VERSION  "0.30"
 
 //--- 信号方向枚举（信号引擎输出）
 enum ENUM_SIGNAL_DIR
@@ -33,17 +33,17 @@ input int               InpEMA_Fast         = 20;         // 快线 EMA 周期�
 input int               InpEMA_Mid          = 60;         // 中线 EMA 周期（优化 40~80 步长10）
 input int               InpEMA_Slow         = 200;        // 慢线 EMA 周期（优化 150~250 步长25）
 input int               InpADX_Period       = 14;         // ADX 周期（不优化）
-input double            InpADX_Threshold    = 22.0;       // ADX 趋势阈值（优化 18~30 步长2）
+input double            InpADX_Threshold    = 20.0;       // ADX 趋势阈值（优化 18~30 步长2；v0.30 由22降至20提升信号频次）
 input bool              InpADX_Rising       = false;      // 要求 ADX 递增（可选增强开关）
 
 //=== 动能确认层：MACD（方案 4.2）====================================
 input int               InpMACD_Fast        = 12;         // MACD 快线（标准值，不优化）
 input int               InpMACD_Slow        = 26;         // MACD 慢线（标准值，不优化）
 input int               InpMACD_Signal      = 9;          // MACD 信号线（标准值，不优化）
-input int               InpMACD_Window      = 3;          // 交叉回溯窗口/根（优化 1~5）
+input int               InpMACD_Window      = 10;         // 交叉回溯窗口/根（优化 3~15；v0.30 由3放宽至10提升动能层通过率）
 
 //=== 突破触发层：唐奇安通道（方案 4.2）==============================
-input int               InpDonchian_Period  = 20;         // 唐奇安周期（优化 10~40 步长5）
+input int               InpDonchian_Period  = 12;         // 唐奇安周期（优化 8~30 步长2；v0.30 由20缩短至12缩小突破回看窗口）
 
 //=== 出场规则（方案 4.4）============================================
 input int               InpATR_Period       = 14;         // ATR 周期（不优化）
@@ -60,8 +60,8 @@ input bool              InpTrailReplacesTP  = false;      // 跟踪启动后取�
 //=== 一单一结机制（方案 4.3）========================================
 //    G5：原单一 InpCooldownBars 拆分为亏损/盈利差异化冷却（方案 4.3
 //    「亏损平仓与盈利平仓可配置不同冷却长度」，默认相同）
-input int               InpCooldownBarsLoss   = 3;        // 亏损平仓冷却 K 线数/H1（G5，优化 0~10）
-input int               InpCooldownBarsProfit = 3;        // 盈利/保本平仓冷却 K 线数/H1（G5，可为 0）
+input int               InpCooldownBarsLoss   = 1;        // 亏损平仓冷却 K 线数/H1（G5；v0.30 由3降至1加快下次入场机会）
+input int               InpCooldownBarsProfit = 1;        // 盈利/保本平仓冷却 K 线数/H1（G5；v0.30 由3降至1）
 
 //=== 资金管理与风控（方案 5 章，红线项不参与优化）====================
 input double            InpRiskPercent      = 1.0;        // 单笔风险 %（实盘固定 ≤1）
@@ -80,7 +80,7 @@ input int               InpSlippagePoints   = 30;         // 最大滑点/点（
 
 //=== 日志与运维（修复四：日志容量与保留策略）=======================
 input int               InpLogKeepDays      = 30;         // 日志保留天数（超期旧日志自动清理）
-input bool              InpVerboseSignalLog = false;      // 信号评估详细日志：逐层未通过原因+指标数值（D2/F4）
+input bool              InpVerboseSignalLog = true;       // 信号评估详细日志：逐层未通过原因+指标数值（D2/F4；v0.30 调试期默认开启便于观察各过滤层拒绝原因，确认正常后可改 false）
 
 //=== 执行常量（修复C2/A2/E2 新增，非优化项故用宏而非 input）=========
 #define GTEA_CLOSE_MAX_ATTEMPTS      3              // 平仓失败单次调用内最大立即重试次数（修复C2）
@@ -98,5 +98,18 @@ input bool              InpVerboseSignalLog = false;      // 信号评估详细�
 //    修复一：前缀不再使用仅含 magic 的宏，改由各模块 Init(magic, symbol)
 //    时生成实例级 m_gvPrefix = "GTEA_"+magic+"_"+symbol+"_"，
 //    避免多图表同 magic 挂载时冷却/风控状态跨品种污染
+
+//=== 点值语义（v0.30 新增：统一美元口径换算，参照 GoldRangeEA）==========
+//    1 点 = 0.01 美元（XAUUSD 报价小数点后第二位变动 1）。
+//    固定 0.01 换算，不依赖 SYMBOL_POINT —— 在 3 位小数报价经纪商上
+//    全部「N 点」参数语义保持不变（解决 SYMBOL_SPREAD 原生点数在 3 位小数
+//    经纪商上返回 300-500 而非期望的 30-50 的口径不一致问题）
+#define GTEA_POINT_VALUE  0.01
+
+//--- 点数 → 价格距离换算（全 EA 唯一口径，点差过滤等模块统一调用）
+double PtsToPrice(const int points)
+  {
+   return points * GTEA_POINT_VALUE;
+  }
 
 #endif // __GTEA_CONFIG_MQH__
