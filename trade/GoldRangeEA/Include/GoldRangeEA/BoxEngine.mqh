@@ -19,8 +19,9 @@ struct SBoxState
    double            upper;       // 箱体上沿（压力位，v1 §2.1）
    double            lower;       // 箱体下沿（支撑位，v1 §2.1）
    double            height;      // 箱体高度（价格单位）
-   double            entryLow;    // 做多入场判定线 = lower + 入场容差（§3.1）
-   double            entryHigh;   // 做空入场判定线 = upper − 入场容差（§3.2）
+   double            entryLow;    // 做多入场区上界 = lower + 入场带（§3.1，双边带判定）
+   double            entryHigh;   // 做空入场区下界 = upper − 入场带（§3.2，双边带判定）
+   double            entryBand;   // 入场带半宽 = max(高度×入场容差%, 容差下限点数)（沿位双边判定，防接飞刀）
    double            tpDist;      // 止盈距离（价格单位；模式A=height×比例，模式B=height 名义值）
    double            slDist;      // 止损距离（价格单位 = height×止损比例）
    bool              valid;       // 是否有效箱体（§2.2 全部条件满足）
@@ -46,6 +47,7 @@ private:
       m_box.height   = 0.0;
       m_box.entryLow = 0.0;
       m_box.entryHigh= 0.0;
+      m_box.entryBand= 0.0;
       m_box.tpDist   = 0.0;
       m_box.slDist   = 0.0;
       m_box.valid    = false;
@@ -120,7 +122,9 @@ public:
         }
       double height = upper - lower;
 
-      //--- ③ 高度过滤（v1 §2.2-1/2：[15,80] 点，太小无利润/太大是趋势）
+      //--- ③ 高度过滤（v1 §2.2-1/2：小于最小高度无利润空间/大于最大高度
+      //    已是趋势；默认 [500,3000] 点按 XAUUSD 实际波动量级重标定，
+      //    见 README「波动率重标定」节）
       if(height < PtsToPrice(InpBoxMinPoints))
          reason = StringFormat("高度 %.1f 点 < 最小 %d 点",
                                height / GREA_POINT_VALUE, InpBoxMinPoints);
@@ -129,10 +133,14 @@ public:
                                height / GREA_POINT_VALUE, InpBoxMaxPoints);
 
       //--- ④ 第二趟线性扫描：触碰计数（基于最终上下沿，v1 §2.2-3）
+      //    触碰容差百分比化：max(高度×触碰容差%, 下限点数)——固定点数
+      //    容差不随箱体量级缩放（小箱体上过宽漏计、大箱体上过窄漏计），
+      //    百分比制下触碰带宽与箱体高度同比例缩放，下限防极矮箱体退化
       int touchUp = 0, touchDown = 0;
       if(reason == "")
         {
-         double tol = PtsToPrice(InpTouchTolerance);
+         double tol = MathMax(height * InpTouchTolerancePct / 100.0,
+                              PtsToPrice(InpTouchTolMinPoints));
          for(int i = 0; i < InpBoxBars; i++)
            {
             if(highs[i] >= upper - tol) touchUp++;      // 上沿触碰：high ≥ 上沿−容差
@@ -162,8 +170,13 @@ public:
       m_box.upper    = upper;
       m_box.lower    = lower;
       m_box.height   = height;
-      m_box.entryLow = lower + PtsToPrice(InpEntryTolerance);   // 做多需 price ≤ 此线
-      m_box.entryHigh= upper - PtsToPrice(InpEntryTolerance);   // 做空需 price ≥ 此线
+      // 入场带百分比化：band = max(高度×入场容差%, 下限点数)，随箱体量级
+      // 自适应缩放；沿位判定为双边带（见 EvaluateEntry），entryLow/entryHigh
+      // 分别为做多/做空入场区靠箱体内侧的边界
+      m_box.entryBand= MathMax(height * InpEntryTolerancePct / 100.0,
+                               PtsToPrice(InpEntryTolMinPoints));
+      m_box.entryLow = lower + m_box.entryBand;   // 做多需 price ≤ 此线（且 ≥ 下沿−band）
+      m_box.entryHigh= upper - m_box.entryBand;   // 做空需 price ≥ 此线（且 ≤ 上沿+band）
       // 止盈距离（v1 §5.1）：模式A=高度×比例；模式B=高度（名义距离，
       // CalcStops 中模式B直接用对侧沿价，tpDist 仅供 CheckMinRR 口径）
       m_box.tpDist   = (InpTPMode == TP_MODE_RATIO) ? height * InpTPRatio : height;
@@ -176,44 +189,76 @@ public:
    //+------------------------------------------------------------------+
    //| Tick 级入场三级漏斗（v1 §3.1/§3.2/§3.3，从最便宜到最贵）：         |
    //|   L1 无有效箱体 → NONE（§3.1-1）                                  |
-   //|   L2 位置过滤：做多需 price ≤ entryLow、做空需 price ≥ entryHigh， |
-   //|      两次 double 比较，箱体中部天然拒绝（§3.3 绝不在中部开仓）     |
-   //|   L3 KDJ 确认：做多 J ≤ 超卖阈值、做空 J ≥ 超买阈值（数据不足静默） |
-   //|   注：price 口径由主 EA 决定（做多传 Ask、做空传 Bid，见主 EA 注释）|
+   //|   L2 位置过滤（双边带，防接飞刀 + 防开仓即秒平，v1.10）：           |
+   //|      做多需 price ≤ 下沿+band（内缘，入场侧报价/成交价口径）且      |
+   //|      opposite ≥ 下沿−band（外缘，对侧报价）；做空需 price ≥ 上沿−   |
+   //|      band 且 opposite ≤ 上沿+band。外缘以对侧报价判定的原因：突破   |
+   //|      联动止损以对侧报价判定（多单看 Bid 跌破下沿−突破点数），若外缘 |
+   //|      用入场侧报价，当 band+点差 > 突破点数时存在开仓瞬间即触发突破  |
+   //|      止损平仓的窗口（每次小亏点差、连亏数笔即触发暂停）；对侧口径下  |
+   //|      开仓瞬间对侧报价距突破联动线至少还有 InpBreakoutPoints−band 的 |
+   //|      余量，从根上消除该窗口。价格暴跌/涨到沿位外侧任意远处亦不算     |
+   //|      "到达沿位"（防接飞刀）；箱体中部天然拒绝（§3.3 绝不在中部开仓）|
+   //|   L3 KDJ 确认（2 根已收盘 K 线窗口）：最近 2 根已收盘 K 线           |
+   //|      （shift=1 或 shift=2）任一根 J 达标即确认——做多 J ≤ 超卖阈值、 |
+   //|      做空 J ≥ 超买阈值（数据不足静默）。单根口径与 Tick 级沿位检查   |
+   //|      存在时间口径错配（沿位本 Tick 到达、J 值却取自上一根收盘），    |
+   //|      放宽为 2 根窗口可覆盖"上一根 J 达标、本根刚回落"的常见形态     |
+   //|   注：price 为入场侧报价（做多传 Ask、做空传 Bid），opposite 为对侧  |
+   //|      报价（做多传 Bid、做空传 Ask），均由主 EA 传入（见主 EA 注释） |
    //+------------------------------------------------------------------+
-   ENUM_SIGNAL_DIR   EvaluateEntry(const double price)
+   ENUM_SIGNAL_DIR   EvaluateEntry(const double price, const double opposite)
      {
       //--- L1：无有效箱体
       if(!m_box.valid)
          return SIGNAL_NONE;
 
-      //--- L2：位置过滤（§3.1-2 / §3.2-2 / §3.3）
-      bool nearLow  = (price <= m_box.entryLow);    // 价格到达下沿+容差内
-      bool nearHigh = (price >= m_box.entryHigh);   // 价格到达上沿−容差内
+      //--- L2：位置过滤（§3.1-2 / §3.2-2 / §3.3，双边带 + 外缘对侧报价）
+      //    内缘以入场侧报价（成交价口径）判定到达沿位；外缘以对侧报价
+      //    判定未深破沿位——与突破联动止损同口径（多单以 Bid 判破位），
+      //    开仓瞬间对侧报价距突破联动线至少还有 InpBreakoutPoints−band
+      //    余量，消除点差导致的"开仓即秒平"窗口；价格远破沿位外侧亦
+      //    不算到达（防接飞刀）
+      bool nearLow  = (price <= m_box.entryLow &&
+                       opposite >= m_box.lower - m_box.entryBand);
+      bool nearHigh = (price >= m_box.entryHigh &&
+                       opposite <= m_box.upper + m_box.entryBand);
       if(!nearLow && !nearHigh)
         {
          if(InpVerboseSignalLog && TimeCurrent() - m_lastDiagTime >= 60)
            {
             m_lastDiagTime = TimeCurrent();
-            m_logger.Info(StringFormat("入场评估: 价 %.2f 在箱体中部(入场区 %.2f~%.2f), 拒绝",
-                                       price, m_box.entryLow, m_box.entryHigh));
+            m_logger.Info(StringFormat("入场评估: 入场价 %.2f/对侧价 %.2f 不在双边入场区(下沿%.2f±%.2f / 上沿%.2f±%.2f), 拒绝",
+                                       price, opposite, m_box.lower, m_box.entryBand,
+                                       m_box.upper, m_box.entryBand));
            }
          return SIGNAL_NONE;
         }
 
-      //--- L3：KDJ 超买超卖确认（§3.1-3 / §3.2-3）
-      double j = 0.0;
-      if(!m_ind.KdjJ(j))
-         return SIGNAL_NONE;                        // 数据不足静默放弃本轮
-      if(nearLow && j <= InpKDJOversold)
+      //--- L3：KDJ 超买超卖确认（§3.1-3 / §3.2-3，2 根已收盘 K 线窗口）
+      double j1 = 0.0, j2 = 0.0;
+      bool   ok1 = m_ind.KdjJ(j1, 1);          // 最近 1 根已收盘 K 线（shift=1）
+      bool   ok2 = m_ind.KdjJ(j2, 2);          // 最近 2 根已收盘 K 线（shift=2）
+      if(!ok1 && !ok2)
+         return SIGNAL_NONE;                    // 数据不足静默放弃本轮
+      bool oversoldOK   = (ok1 && j1 <= InpKDJOversold)   || (ok2 && j2 <= InpKDJOversold);
+      bool overboughtOK = (ok1 && j1 >= InpKDJOverbought) || (ok2 && j2 >= InpKDJOverbought);
+      if(nearLow && oversoldOK)
          return SIGNAL_BUY;
-      if(nearHigh && j >= InpKDJOverbought)
+      if(nearHigh && overboughtOK)
          return SIGNAL_SELL;
       if(InpVerboseSignalLog && TimeCurrent() - m_lastDiagTime >= 60)
         {
          m_lastDiagTime = TimeCurrent();
-         m_logger.Info(StringFormat("入场评估: 已到沿位但 J=%.1f 未达阈值(超卖≤%d/超买≥%d), 放弃",
-                                    j, InpKDJOversold, InpKDJOverbought));
+         string jText;
+         if(ok1 && ok2)
+            jText = StringFormat("J1=%.1f/J2=%.1f", j1, j2);
+         else if(ok1)
+            jText = StringFormat("J1=%.1f", j1);
+         else
+            jText = StringFormat("J2=%.1f", j2);
+         m_logger.Info(StringFormat("入场评估: 已到沿位但 %s 未达阈值(超卖≤%d/超买≥%d), 放弃",
+                                    jText, InpKDJOversold, InpKDJOverbought));
         }
       return SIGNAL_NONE;
      }

@@ -11,7 +11,7 @@
 #property link      ""
 // 版本号与 Config.mqh 的 GREA_VERSION 保持同步（#property 不支持
 // 宏展开，升版时两处同步修改）
-#property version   "1.00"
+#property version   "1.10"
 #property description "箱体震荡高抛低吸一单一结EA：M15箱体识别+KDJ超买超卖+ADX趋势过滤，同一时刻最多1单"
 #property strict
 
@@ -82,9 +82,36 @@ int OnInit()
       g_logger.Error("参数校验失败: 固定手数须 > 0");
       return INIT_PARAMETERS_INCORRECT;
      }
-   if(InpTouchTolerance < 0 || InpEntryTolerance < 0)
+   if(InpTouchTolerancePct < 0 || InpEntryTolerancePct < 0 ||
+      InpTouchTolMinPoints < 0 || InpEntryTolMinPoints < 0)
      {
-      g_logger.Error("参数校验失败: 触碰容差/入场容差须 ≥ 0");
+      g_logger.Error("参数校验失败: 触碰容差/入场容差(百分比与下限点数)须 ≥ 0");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   //--- 以下 4 项为重标定评审修复补充：容差/入场带量级耦合校验
+   if(InpTouchTolerancePct >= 50 || InpEntryTolerancePct >= 50)
+     {
+      g_logger.Error(StringFormat("参数校验失败: 触碰/入场容差百分比(%.1f%%/%.1f%%)须 < 50, 否则容差达箱高一半、箱体中部不开仓语义被破坏; 若从旧版本升级, 请先删除/重建 .set 文件后重试(旧参数值会被按参数名静默覆盖)",
+                                  InpTouchTolerancePct, InpEntryTolerancePct));
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if((InpTouchTolerancePct <= 0 && InpTouchTolMinPoints <= 0) ||
+      (InpEntryTolerancePct <= 0 && InpEntryTolMinPoints <= 0))
+     {
+      g_logger.Error("参数校验失败: 触碰/入场容差的百分比与下限点数不可同时为 0(容差恒为 0, 判定退化为精确相等且永不触发); 若从旧版本升级, 请先删除/重建 .set 文件后重试(旧参数值会被按参数名静默覆盖)");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if(2 * InpEntryTolMinPoints >= InpBoxMinPoints)
+     {
+      g_logger.Error(StringFormat("参数校验失败: 入场容差下限 %d 点过大(须 < 箱体最小高度 %d 点的一半), 否则最小箱体上两侧入场带重叠; 若从旧版本升级, 请先删除/重建 .set 文件后重试(旧参数值会被按参数名静默覆盖)",
+                                  InpEntryTolMinPoints, InpBoxMinPoints));
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if(MathMax(InpEntryTolerancePct * InpBoxMaxPoints / 100.0, InpEntryTolMinPoints) >= InpBreakoutPoints)
+     {
+      g_logger.Error(StringFormat("参数校验失败: 突破联动点数 %d 须大于最大可能入场带半宽 %.1f 点, 否则存在开仓即触发突破平仓的窗口; 若从旧版本升级, 请先删除/重建 .set 文件后重试(旧参数值会被按参数名静默覆盖)",
+                                  InpBreakoutPoints,
+                                  MathMax(InpEntryTolerancePct * InpBoxMaxPoints / 100.0, InpEntryTolMinPoints)));
       return INIT_PARAMETERS_INCORRECT;
      }
    if(InpMaxHoldHours < 0)
@@ -93,6 +120,9 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
      }
    //--- 以下 5 项为评审修复 F6 补充：非法参数直接拒启，防参数扫描踩坑
+   //    InpBreakoutPoints=0 虽通过本条 ≥0 校验，但实际会被上方的量级耦合
+   //    校验拒绝（入场带半宽 > 0 时存在开仓即秒平窗口），有效下限为大于
+   //    最大入场带半宽
    if(InpBreakoutPoints < 0)
      {
       g_logger.Error("参数校验失败: 突破幅度须 ≥ 0（负值会形成开仓秒平循环）");
@@ -126,6 +156,19 @@ int OnInit()
    if(MathAbs(symPoint - GREA_POINT_VALUE) > 1e-9)
       g_logger.Warn(StringFormat("注意: 品种 SYMBOL_POINT=%.5f ≠ %.2f, 策略参数按 1点=0.01美元 口径解释, 点差过滤与滑点已自动换算适配",
                                  symPoint, GREA_POINT_VALUE));
+
+   //--- 生效配置日志（重标定评审修复）：启动时打印关键参数供用户核对是否
+   //    为重标定值——旧 .set 文件会按参数名静默覆盖新默认值（箱体/容差/
+   //    突破类旧值会被上方参数校验拒启，KDJ 阈值类旧值静默通过但压低
+   //    频次），升级后务必核对本行（README 升级提示）
+   g_logger.Info(StringFormat(
+      "生效配置: 箱体窗口=%d根 高度=[%d,%d]点 入场容差=%.1f%%+下限%d点 触碰容差=%.1f%%+下限%d点 KDJ超卖/超买=%d/%d 突破联动=%d点 日亏熔断=%.0f美元 连亏暂停=%d笔 点差上限=%d点",
+      InpBoxBars, InpBoxMinPoints, InpBoxMaxPoints,
+      InpEntryTolerancePct, InpEntryTolMinPoints,
+      InpTouchTolerancePct, InpTouchTolMinPoints,
+      InpKDJOversold, InpKDJOverbought,
+      InpBreakoutPoints, InpMaxDailyLossUSD,
+      InpMaxConsecSL, InpMaxSpreadPoints));
 
    //--- 3. 账户模式记录（Netting/Hedging 适配）
    long marginMode = AccountInfoInteger(ACCOUNT_MARGIN_MODE);
@@ -234,14 +277,20 @@ void OnTick()
 
    //--- ⑦ Tick 级入场评估：箱体三级漏斗（有效箱体 → 沿位 → KDJ）
    //    价格口径（与实际成交价一致，避免信号/成交偏差）：
-   //    做多以 Ask 判定（买单成交价）、做空以 Bid 判定（卖单成交价），
-   //    两次调用先 Ask 后 Bid；箱体中部两次都在 L2 被廉价拒绝（§3.3）
+   //    做多以 (Ask, Bid) 调用——入场侧 Ask（买单成交价）判内缘、对侧
+   //    Bid 判外缘；做空以 (Bid, Ask) 调用——入场侧 Bid（卖单成交价）
+   //    判内缘、对侧 Ask 判外缘。外缘对侧口径与突破联动止损一致（多单
+   //    以 Bid 判破位），消除点差导致的开仓即秒平窗口（v1.10，评审
+   //    问题1修复）；两个报价任一无效（≤0）则跳过本轮评估；箱体中部
+   //    两次都在 L2 被廉价拒绝（§3.3）
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(ask <= 0 || bid <= 0)
+      return;
    ENUM_SIGNAL_DIR sig = SIGNAL_NONE;
-   if(ask > 0 && g_box.EvaluateEntry(ask) == SIGNAL_BUY)
+   if(g_box.EvaluateEntry(ask, bid) == SIGNAL_BUY)
       sig = SIGNAL_BUY;
-   else if(bid > 0 && g_box.EvaluateEntry(bid) == SIGNAL_SELL)
+   else if(g_box.EvaluateEntry(bid, ask) == SIGNAL_SELL)
       sig = SIGNAL_SELL;
    if(sig == SIGNAL_NONE)
       return;
