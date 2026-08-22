@@ -10,8 +10,8 @@
 #property link      ""
 // F1：版本号与 Config.mqh 的 GTEA_VERSION 保持同步（#property 不支持
 //     宏展开，升版时两处同步修改）
-#property version   "0.30"
-#property description "顺势一单一结 EA 框架：H4趋势+H1三重过滤，同一时刻最多1单"
+#property version   "0.31"
+#property description "顺势一单一结 EA 框架：H1趋势+M15短线过滤，同一时刻最多1单"
 #property strict
 
 #include <GoldTrendEA/Config.mqh>

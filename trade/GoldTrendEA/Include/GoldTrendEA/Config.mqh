@@ -11,7 +11,7 @@
 
 //--- F1：EA 版本号统一定义（日志头等处引用；#property version 不支持
 //    宏展开，主 EA 中的 #property 需随本宏同步手工更新）
-#define GTEA_VERSION  "0.30"
+#define GTEA_VERSION  "0.31"
 
 //--- 信号方向枚举（信号引擎输出）
 enum ENUM_SIGNAL_DIR
@@ -25,36 +25,36 @@ enum ENUM_SIGNAL_DIR
 input long              InpMagic            = 20260813;   // EA 魔术号（持仓过滤唯一标识）
 
 //=== 周期设置（方案 4.1：H4 定方向 + H1 信号）=======================
-input ENUM_TIMEFRAMES   InpTrendTF          = PERIOD_H4;  // 趋势周期（固定 H4，不优化）
-input ENUM_TIMEFRAMES   InpSignalTF         = PERIOD_H1;  // 信号周期（固定 H1，不优化）
+input ENUM_TIMEFRAMES   InpTrendTF          = PERIOD_H1;  // 趋势周期（v0.31 短线默认 H1）
+input ENUM_TIMEFRAMES   InpSignalTF         = PERIOD_M15; // 信号周期（v0.31 短线默认 M15）
 
 //=== 趋势方向层：EMA 排列 + ADX 强度（方案 4.1）=====================
-input int               InpEMA_Fast         = 20;         // 快线 EMA 周期（优化 10~30 步长5）
-input int               InpEMA_Mid          = 60;         // 中线 EMA 周期（优化 40~80 步长10）
-input int               InpEMA_Slow         = 200;        // 慢线 EMA 周期（优化 150~250 步长25）
+input int               InpEMA_Fast         = 10;         // 快线 EMA 周期（v0.31 短线默认）
+input int               InpEMA_Mid          = 30;         // 中线 EMA 周期（v0.31 短线默认）
+input int               InpEMA_Slow         = 100;        // 慢线 EMA 周期（v0.31 短线默认）
 input int               InpADX_Period       = 14;         // ADX 周期（不优化）
-input double            InpADX_Threshold    = 20.0;       // ADX 趋势阈值（优化 18~30 步长2；v0.30 由22降至20提升信号频次）
+input double            InpADX_Threshold    = 16.0;       // ADX 趋势阈值（v0.31 降低以捕捉日内趋势启动）
 input bool              InpADX_Rising       = false;      // 要求 ADX 递增（可选增强开关）
 
 //=== 动能确认层：MACD（方案 4.2）====================================
 input int               InpMACD_Fast        = 12;         // MACD 快线（标准值，不优化）
 input int               InpMACD_Slow        = 26;         // MACD 慢线（标准值，不优化）
 input int               InpMACD_Signal      = 9;          // MACD 信号线（标准值，不优化）
-input int               InpMACD_Window      = 10;         // 交叉回溯窗口/根（优化 3~15；v0.30 由3放宽至10提升动能层通过率）
+input int               InpMACD_Window      = 16;         // 动能回溯窗口/根（v0.31 M15约4小时）
 
 //=== 突破触发层：唐奇安通道（方案 4.2）==============================
-input int               InpDonchian_Period  = 12;         // 唐奇安周期（优化 8~30 步长2；v0.30 由20缩短至12缩小突破回看窗口）
+input int               InpDonchian_Period  = 6;          // 唐奇安周期（v0.31 M15约90分钟）
 
 //=== 出场规则（方案 4.4）============================================
 input int               InpATR_Period       = 14;         // ATR 周期（不优化）
-input double            InpSL_ATR_Mult      = 2.0;        // 止损 ATR 倍数（优化 1.5~3.0 步长0.25）
-input int               InpSwingBars        = 10;         // 结构点回溯根数（优化 5~20 步长5）
-input double            InpRR               = 1.8;        // 固定盈亏比（优化 1.2~2.5 步长0.2）
+input double            InpSL_ATR_Mult      = 1.2;        // 止损 ATR 倍数（v0.31 短线收紧）
+input int               InpSwingBars        = 5;          // 结构点回溯根数（v0.31 短线收紧）
+input double            InpRR               = 1.3;        // 固定盈亏比（v0.31 短线快进快出）
 input bool              InpUseBreakEven     = true;       // 启用保本推损（G1，方案 4.4 默认启用）
-input double            InpBE_Trigger       = 1.0;        // 保本触发/倍止损距离（优化 0.6~1.5）
-input double            InpBE_Offset        = 0.3;        // 保本偏移/美元（优化 0~1.0）
+input double            InpBE_Trigger       = 0.7;        // 保本触发/倍止损距离（v0.31 更早保护）
+input double            InpBE_Offset        = 0.2;        // 保本偏移/美元（v0.31 短线小偏移）
 input bool              InpUseTrailing      = true;       // 启用ATR+结构点跟踪止损（G2/G3，方案 4.4 默认启用）
-input double            InpTrail_ATR_Mult   = 2.5;        // 跟踪止损 ATR 倍数（优化 1.5~3.5 步长0.5）
+input double            InpTrail_ATR_Mult   = 1.4;        // 跟踪止损 ATR 倍数（v0.31 M15收紧）
 input bool              InpTrailReplacesTP  = false;      // 跟踪启动后取消固定TP（风格对比开关）
 
 //=== 一单一结机制（方案 4.3）========================================

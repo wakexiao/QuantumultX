@@ -93,6 +93,15 @@ private:
       if(dir > 0 && main[0] <= sig[0]) return false;
       if(dir < 0 && main[0] >= sig[0]) return false;
 
+      // v0.31 short-term relaxation: M15 entries can miss the exact cross.
+      // If MACD is aligned and the latest histogram is strengthening, pass.
+      double histNow  = main[0] - sig[0];
+      double histPrev = main[1] - sig[1];
+      if(dir > 0 && histNow > 0 && histNow > histPrev)
+         return true;
+      if(dir < 0 && histNow < 0 && histNow < histPrev)
+         return true;
+
       // 交叉窗口回溯：窗口内任意相邻两根发生同向交叉即满足
       for(int i = 0; i < InpMACD_Window; i++)
         {

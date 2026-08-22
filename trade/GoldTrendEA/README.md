@@ -1,7 +1,13 @@
 # GoldTrendEA — 黄金外汇「顺势一单一结」EA 框架
 
+## v0.31 Short-Term Defaults
+
+This version changes the default profile from swing-style H4/H1 filtering to a faster H1/M15 setup aimed at roughly 2-3 XAUUSD trades per active trend day. The main changes are: H1 trend filter, M15 signal bars, EMA 10/30/100, ADX 16, MACD lookback 16, Donchian 6, ATR stop 1.2, RR 1.3, earlier break-even, and tighter trailing.
+
+The MACD layer now also accepts strengthening same-direction histogram momentum, so the EA can still enter after missing the exact MACD cross bar. Risk controls, one-position-at-a-time behavior, spread filtering, daily/weekly loss halts, and margin checks are unchanged.
+
 > 对应方案文档：[黄金外汇EA顺势一单一结开发方案.md](../黄金外汇EA顺势一单一结开发方案.md)
-> 当前版本：v0.30（版本号统一由 `Config.mqh` 的 `GTEA_VERSION` 定义；框架+出场增强+健壮性优化+开单频率优化阶段产出，**非完整可交易版本**）
+> 当前版本：v0.31（版本号统一由 `Config.mqh` 的 `GTEA_VERSION` 定义；短线默认参数+开单频率优化阶段产出，**非完整可交易版本**）
 
 ## 目录结构
 
